@@ -32,37 +32,6 @@ void naive_gemm(const float* A, const float* B, float* C, int64_t M, int64_t N, 
   }
 }
 
-int main0()
-{
-  nn::tensor::data_t<float> src{{3, 4}};
-  for (int y = 0; y < src.dims[0]; y++) {
-    for (int x = 0; x < src.dims[1]; x++) {
-      src.xs[y * src.dims[1] + x] = y;
-    }
-  }
-
-  nn::tensor::data_t<float> dst{{4, 3}};
-  nn::gemm::transpose<1>(src.xs, dst.xs, src.dims[0], src.dims[1]);
-
-  for (int y = 0; y < src.dims[0]; y++) {
-    for (int x = 0; x < src.dims[1]; x++) {
-      std::cout << src.xs[y * src.dims[1] + x] << " ";
-    }
-    std::cout << std::endl;
-  }
-  std::cout << std::endl;
-
-  for (int y = 0; y < dst.dims[0]; y++) {
-    for (int x = 0; x < dst.dims[1]; x++) {
-      std::cout << dst.xs[y * dst.dims[1] + x] << " ";
-    }
-    std::cout << std::endl;
-  }
-  std::cout << std::endl;
-
-  return 0;
-}
-
 int main()
 {
   constexpr auto M = 128;
@@ -74,7 +43,7 @@ int main()
   auto cpuC = nn::tensor::data_t<float>::zero({M, P});
 
   naive_gemm(A.xs, B.xs, naiveC.xs, naiveC.dims[0], A.dims[1], naiveC.dims[1]);
-  nn::tensor::matmul(A, B, cpuC);
+  nn::tensor::mul(A, B, cpuC);
 
   for (uint i = 0; i < M * P; i++) {
     if (cpuC.xs[i] != naiveC.xs[i]) {

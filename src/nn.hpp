@@ -54,6 +54,13 @@ namespace nn {
 #endif
   }
 
+  namespace dot {
+    void cpu(const float* x, const float* y, float* output, int64_t N);
+#ifdef GPU
+    void gpu(id<MTLCommandBuffer> cmd, id<MTLBuffer> X, id<MTLBuffer> Y, id<MTLBuffer> output);
+#endif
+  }
+
   namespace utils {
     template <typename xs_t>
       static typename xs_t::value_type area(const xs_t& xs) {
@@ -97,7 +104,7 @@ namespace nn {
       }
     };
 
-    void matmul(const data_t<float>& A, const data_t<float>& B, data_t<float>& C);
+    void mul(const data_t<float>& A, const data_t<float>& B, data_t<float>& C);
   }
 }
 
@@ -267,14 +274,84 @@ namespace nn::gemv {
 #endif
 }
 
-namespace nn::tensor {
-  void matmul(const data_t<float>& A, const data_t<float>& B, data_t<float>& C)
+namespace nn::dot {
+  void cpu(const float* x, const float* y, float* output, int64_t N)
   {
-    assert(A.dims.size() == 2);
-    assert(B.dims.size() == 2);
-    assert(C.dims.size() == 2);
+    output = 0;
+    for (int64_t i = 0; i < N; i++) {
+      *output += x[i] * y[i];
+    }
+  }
+#ifdef GPU
+  void gpu(id<MTLCommandBuffer> cmd, id<MTLBuffer> x, id<MTLBuffer> y, id<MTLBuffer> output)
+  {
+    assert(x.length == y.length);
+    const uint64_t N = x.length / sizeof(float);
+    
+    static id<MTLComputePipelineState> kernel0;
+    static id<MTLComputePipelineState> kernel1;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        auto kernel0Func = [gpu::lib newFunctionWithName:@"dot_reduce0"];
+        auto kernel1Func = [gpu::lib newFunctionWithName:@"dot_reduce1"];
+        kernel0 = [gpu::device newComputePipelineStateWithFunction:kernel0Func error:nil];
+        kernel1 = [gpu::device newComputePipelineStateWithFunction:kernel1Func error:nil];
+    });
+    if (!kernel0 || !kernel1) {
+        NSLog(@"got error during pipeline creation");
+        return;
+    }
+    
+    auto threadsPerThreadgroup = MTLSizeMake(1024, 1, 1);
+    auto threadgroupMemFloats = 1024 * 2;
+    auto floatsPerThreadgroup = threadgroupMemFloats * 4;
+    auto threadgroupsWidth = N / floatsPerThreadgroup;
+    auto threadgroups = MTLSizeMake(threadgroupsWidth, 1, 1);
+    id<MTLBuffer> interm = [gpu::device newBufferWithLength:threadgroups.width * sizeof(float) options:MTLResourceStorageModePrivate];
+    
+    auto encoder = [cmd computeCommandEncoder];
+    [encoder setBuffer:x offset:0 atIndex:0];
+    [encoder setBuffer:y offset:0 atIndex:1];
+    [encoder setBuffer:interm offset:0 atIndex:2];
+    [encoder setBytes:(void*)&N length:sizeof(N) atIndex:3];
+    [encoder setThreadgroupMemoryLength:threadgroupMemFloats * sizeof(float) atIndex:0];
+    [encoder setComputePipelineState:kernel0];
+    [encoder dispatchThreadgroups:threadgroups threadsPerThreadgroup:threadsPerThreadgroup];
+    
+    [encoder setBuffer:interm offset:0 atIndex:0];
+    [encoder setBuffer:output offset:0 atIndex:1];
+    [encoder setBytes:(void*)&threadgroupsWidth length:sizeof(threadgroupsWidth) atIndex:2];
+    [encoder setThreadgroupMemoryLength:threadgroupsWidth * sizeof(float) atIndex:0];
+    [encoder setComputePipelineState:kernel1];
+    [encoder dispatchThreads:MTLSizeMake(threadgroupsWidth, 1, 1) threadsPerThreadgroup:MTLSizeMake(threadgroupsWidth, 1, 1)];
+    
+    [encoder endEncoding];
+  }
+#endif
+}
 
-    nn::gemm::cpu(A.xs, B.xs, C.xs, C.dims[0], A.dims[1], C.dims[1]);
+namespace nn::tensor {
+  void mul(const data_t<float>& A, const data_t<float>& B, data_t<float>& C)
+  {
+    if (A.dims.size() == 2 && B.dims.size() == 2) {
+        assert(C.dims.size() == 2);
+        assert(A.dims[0] == C.dims[0]);
+        assert(A.dims[1] == B.dims[0]);
+        assert(B.dims[0] == C.dims[1]);
+        nn::gemm::cpu(A.xs, B.xs, C.xs, C.dims[0], A.dims[1], C.dims[1]);
+    } else if (A.dims.size() == 1 && B.dims.size() == 1) {
+        assert(C.dims.size() == 1);
+        assert(A.dims[0] == B.dims[0]);
+        assert(1 == C.dims[0]);
+        nn::dot::cpu(A.xs, B.xs, C.xs, A.dims[1]);
+    } else if (A.dims.size() == 2 && B.dims.size() == 1) {
+        assert(C.dims.size() == 1);
+        assert(C.dims[0] == A.dims[0]);
+        assert(B.dims[0] == A.dims[1]);
+        nn::gemv::cpu(A.xs, B.xs, C.xs, A.dims[0], A.dims[1]);
+    } else {
+      assert(false);
+    }
   }
 }
 

@@ -147,3 +147,55 @@ kernel void sgemv(
         }
     }
 }
+
+kernel void dot_reduce0(
+                   const device float4* X,
+                   const device float4* Y,
+                   device float* output,
+                   constant const uint64_t& N,
+                   threadgroup float* shared,
+                   uint gid [[thread_position_in_grid]],
+                   uint lid [[thread_position_in_threadgroup]],
+                   uint group_id [[threadgroup_position_in_grid]],
+                   uint group_size [[threads_per_threadgroup]],
+                   uint groups [[threadgroups_per_grid]]
+                   )
+{
+    shared[lid] = dot(X[(group_id * group_size + lid)], Y[(group_id * group_size + lid)]);
+    X += groups * group_size;
+    Y += groups * group_size;
+    shared[group_size + lid] = dot(X[(group_id * group_size + lid)], Y[(group_id * group_size + lid)]);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint offset = group_size; offset > 0; offset = offset >> 1) {
+        if (lid < offset) {
+            shared[lid] += shared[lid + offset];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    
+    if (lid == 0) output[group_id] = shared[0];
+}
+
+kernel void dot_reduce1(
+                          const device float* X,
+                          device float* output,
+                          constant const uint& N,
+                          threadgroup float* shared,
+                          uint gid [[thread_position_in_grid]],
+                          uint lid [[thread_position_in_threadgroup]],
+                          uint group_size [[threads_per_threadgroup]]
+                          )
+{
+    shared[lid] = X[lid];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    
+    for (uint offset = group_size / 2; offset > 0; offset >>= 1) {
+        if (lid < offset) {
+            shared[lid] += shared[lid + offset];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    
+    output[0] = shared[0];
+}
