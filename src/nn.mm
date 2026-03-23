@@ -2,6 +2,7 @@
 
 #include <MacTypes.h>
 #include <iostream>
+#include <sstream>
 #include <vector>
 #include <random>
 #include <algorithm>
@@ -13,6 +14,135 @@
 #import <Metal/Metal.h>
 
 namespace nn {
+
+  namespace utils {
+    template <typename xs_t>
+      static typename xs_t::value_type area(const xs_t& xs) {
+        typename xs_t::value_type out = 1;
+        for (auto x : xs) {
+          out *= x;
+        }
+        return out;
+      }
+
+      template<typename xs_t>
+      std::string xs2str(xs_t xs) {
+        std::ostringstream ss;
+        ss << "[";
+        for (auto x : xs) {
+          ss << x << " ";
+        }
+        ss << "]";
+        return ss.str();
+      }
+  }
+
+  namespace tensor {
+    struct data_t {
+      std::vector<int64_t> dims;
+      id<MTLBuffer> xs;
+
+      data_t(std::initializer_list<int64_t> dims, id<MTLBuffer> xs) : dims(dims), xs(xs) {}
+      data_t(std::vector<int64_t> dims, id<MTLBuffer> xs) : dims(dims), xs(xs) {}
+
+      static data_t value(std::initializer_list<float> list);
+
+      static data_t random(std::initializer_list<int64_t> dims);
+      template<typename dims_t>
+      static data_t copy(dims_t dims, const float* data);
+      static data_t copy(std::initializer_list<int64_t> dims, const float* data);
+
+      static data_t zero(std::initializer_list<int64_t> dims);
+      template<typename dims_t>
+      static data_t zero(dims_t dims);
+
+      static data_t fill(std::initializer_list<int64_t> dims, float x);
+
+      template<typename tensors>
+      static data_t concat(tensors xs);
+
+      float* data() const {
+        return (float*)[xs contents];
+      }
+
+      int64_t size() const {
+        return utils::area(dims);
+      }
+
+      template<typename dims_t>
+      void resize(dims_t dims) {
+        this->dims = dims;
+      }
+
+      void flatten() {
+        this->dims = {size()};
+      }
+
+      void transpose();
+    };
+
+    enum class device_type {
+      cpu,
+      gpu
+    };
+    void matmul(const data_t& A, const data_t& B, data_t& C, device_type dev=device_type::cpu);
+    void add(const data_t& A, const data_t& B, data_t& C, device_type dev=device_type::cpu);
+    void mul(const data_t& A, const data_t& B, data_t& C, device_type dev=device_type::cpu);
+    void sigmoid(const data_t& A, data_t& C, device_type=device_type::cpu);
+  }
+
+  namespace layer {
+    struct linear {
+      tensor::data_t weights;
+      tensor::data_t biases;
+      tensor::data_t output;
+
+      linear(int64_t inputsCount, int64_t outputsCount)
+        : weights(tensor::data_t::random({outputsCount, inputsCount}))
+        , biases(tensor::data_t::random({outputsCount}))
+        , output(tensor::data_t::zero({outputsCount}))
+        {}
+
+      linear(tensor::data_t weights, tensor::data_t biases)
+        : weights(weights)
+          , biases(biases)
+          , output(tensor::data_t::zero({biases.size()}))
+          {
+            assert(weights.dims.size() == 2);
+            assert(biases.dims.size() == 1);
+            assert(weights.dims[0] == biases.dims[0]);
+          }
+      
+      tensor::data_t& forward(const tensor::data_t& input)
+      {
+        if (input.dims.size() != output.dims.size()) {
+          std::vector<int64_t> dims;
+          dims.push_back(biases.size());
+          if (input.dims.size() == 2) {
+            dims.push_back(input.dims.back());
+          }
+          output = tensor::data_t::zero(dims);
+        }
+        matmul(weights, input, output);
+        add(output, biases, output);
+        sigmoid(output, output);
+        return output;
+      }
+
+    };
+  }
+
+  namespace helpers {
+    tensor::data_t& forward(std::vector<nn::layer::linear>& model, const tensor::data_t& input);
+
+    template<typename dims_t>
+      std::vector<nn::layer::linear> buildModel(dims_t dims);
+  }
+
+  namespace cost {
+    tensor::data_t quadratic(std::vector<nn::layer::linear>& model, const tensor::data_t& inputs, const tensor::data_t& outputs);
+  }
+
   namespace cpu {
     dispatch_queue_t queue = dispatch_queue_create("nntel", NULL);
 
@@ -106,73 +236,6 @@ namespace nn {
   }
 
 
-  namespace utils {
-    template <typename xs_t>
-      static typename xs_t::value_type area(const xs_t& xs) {
-        typename xs_t::value_type out = 1;
-        for (auto x : xs) {
-          out *= x;
-        }
-        return out;
-      }
-  }
-
-  namespace tensor {
-    struct data_t {
-      std::vector<int64_t> dims;
-      id<MTLBuffer> xs;
-
-      data_t(std::initializer_list<int64_t> dims, id<MTLBuffer> xs) : dims(dims), xs(xs) {}
-      data_t(std::vector<int64_t> dims, id<MTLBuffer> xs) : dims(dims), xs(xs) {}
-
-      static data_t random_int(std::initializer_list<int64_t> dims) {
-        auto size = utils::area(dims) * sizeof(float);
-        auto storage = [gpu::device newBufferWithLength:size options:MTLResourceStorageModeShared];
-
-        data_t out{dims, storage};
-        auto area = utils::area(out.dims);
-        for (auto i = 0; i < area; i++) {
-          out.data()[i] = (float)(rand() % 100);
-        }
-        return out;
-      }
-
-      static data_t zero(std::initializer_list<int64_t> dims) {
-        auto size = utils::area(dims) * sizeof(float);
-        auto storage = [gpu::device newBufferWithLength:size options:MTLResourceStorageModeShared];
-
-        data_t out{dims, storage};
-        memset(out.data(), 0, utils::area(out.dims) * sizeof(out.data()[0]));
-        return out;
-      }
-
-      static data_t fill(std::initializer_list<int64_t> dims, float x) {
-        auto size = utils::area(dims) * sizeof(float);
-        auto storage = [gpu::device newBufferWithLength:size options:MTLResourceStorageModeShared];
-
-        data_t out{dims, storage};
-        for (int64_t i = 0; i < out.size(); i++) {
-          out.data()[i] = x;
-        }
-        return out;
-      }
-
-      float* data() const {
-        return (float*)[xs contents];
-      }
-
-      int64_t size() const {
-        return utils::area(dims);
-      }
-    };
-
-    enum class device_type {
-      cpu,
-      gpu
-    };
-    void mul(const data_t& A, const data_t& B, data_t& C, device_type dev=device_type::cpu);
-    void add(const data_t& A, const data_t& B, data_t& C, device_type dev=device_type::cpu);
-  }
 }
 
 
@@ -239,23 +302,121 @@ namespace nn {
 #ifdef NN_IMPL
 
 namespace nn::tensor {
-  void cpu_mul(const data_t& A, const data_t& B, data_t& C);
-  void gpu_mul(const data_t& A, const data_t& B, data_t& C);
+
+  std::mt19937 gen{};
+
+  void cpu_matmul(const data_t& A, const data_t& B, data_t& C);
+  void gpu_matmul(const data_t& A, const data_t& B, data_t& C);
 
   void cpu_add(const data_t& A, const data_t& B, data_t& C);
   void gpu_add(const data_t& A, const data_t& B, data_t& C);
 
+  void cpu_mul(const data_t& A, const data_t& B, data_t& C);
+  void gpu_mul(const data_t& A, const data_t& B, data_t& C);
 
-  void mul(const data_t& A, const data_t& B, data_t& C, device_type dev)
+  void cpu_sigmoid(const data_t& A, data_t& C);
+  void gpu_sigmoid(const data_t& A, data_t& C);
+
+  data_t data_t::value(std::initializer_list<float> list)
+  {
+    auto size = list.size() * sizeof(float);
+    auto storage = [gpu::device newBufferWithBytes:(const void*)list.begin() length:size options:MTLResourceStorageModeShared];
+
+    data_t out {{(int64_t)size}, storage};
+    return out;
+  }
+
+  template<typename dims_t>
+  data_t data_t::copy(dims_t dims, const float* data) {
+    auto size = utils::area(dims) * sizeof(float);
+    auto storage = [gpu::device newBufferWithBytes:(const void*)data length:size options:MTLResourceStorageModeShared];
+
+    data_t out{dims, storage};
+    return out;
+  }
+
+  data_t data_t::copy(std::initializer_list<int64_t> dims, const float* data) {
+    auto size = utils::area(dims) * sizeof(float);
+    auto storage = [gpu::device newBufferWithBytes:(const void*)data length:size options:MTLResourceStorageModeShared];
+
+    data_t out{dims, storage};
+    return out;
+  }
+
+  data_t data_t::zero(std::initializer_list<int64_t> dims) {
+    auto size = utils::area(dims) * sizeof(float);
+    auto storage = [gpu::device newBufferWithLength:size options:MTLResourceStorageModeShared];
+
+    data_t out{dims, storage};
+    memset(out.data(), 0, utils::area(out.dims) * sizeof(out.data()[0]));
+    return out;
+  }
+
+  template<typename dims_t>
+    data_t data_t::zero(dims_t dims) {
+      auto size = utils::area(dims) * sizeof(float);
+      auto storage = [gpu::device newBufferWithLength:size options:MTLResourceStorageModeShared];
+
+      data_t out{dims, storage};
+      memset(out.data(), 0, utils::area(out.dims) * sizeof(out.data()[0]));
+      return out;
+    }
+
+  data_t data_t::fill(std::initializer_list<int64_t> dims, float x) {
+    auto size = utils::area(dims) * sizeof(float);
+    auto storage = [gpu::device newBufferWithLength:size options:MTLResourceStorageModeShared];
+
+    data_t out{dims, storage};
+    for (int64_t i = 0; i < out.size(); i++) {
+      out.data()[i] = x;
+    }
+    return out;
+  }
+
+  data_t data_t::random(std::initializer_list<int64_t> dims) {
+    auto size = utils::area(dims) * sizeof(float);
+    auto storage = [gpu::device newBufferWithLength:size options:MTLResourceStorageModeShared];
+
+    std::normal_distribution<float> dstr(0.0, 1.0);
+
+    data_t out{dims, storage};
+    auto area = utils::area(out.dims);
+    for (auto i = 0; i < area; i++) {
+      out.data()[i] = dstr(gen);
+    }
+    return out;
+  }
+
+  template<typename tensors>
+  data_t data_t::concat(tensors xs) {
+    auto singleSize = xs.begin()->size();
+    uint64_t size = 0;
+    for (auto& x : xs) {
+      assert(x.size() == singleSize);
+      size += utils::area(x.dims);
+    }
+
+    auto storage = [gpu::device newBufferWithLength:size * sizeof(float) options:MTLResourceStorageModeShared];
+    uint64_t i = 0;
+    for (auto& x : xs) {
+      memcpy(((float*)[storage contents]) + singleSize * i, x.data(), x.size() * sizeof(float));
+      i += 1;
+    }
+
+    data_t out{{(int64_t)xs.size(), singleSize}, storage};
+    return out;
+  }
+
+  void matmul(const data_t& A, const data_t& B, data_t& C, device_type dev)
   {
     if (dev == device_type::cpu) {
       nn::stream::global.cpu_dispatch(^() {
-          cpu_mul(A, B, C);
+          cpu_matmul(A, B, C);
       });
     }
     else if (dev == device_type::gpu) {
       nn::stream::global.gpu_dispatch(^() {
-          gpu_mul(A, B, C);
+          gpu_matmul(A, B, C);
       });
     }
   }
@@ -274,6 +435,34 @@ namespace nn::tensor {
     }
   }
 
+  void mul(const data_t& A, const data_t& B, data_t& C, device_type dev)
+  {
+    if (dev == device_type::cpu) {
+      nn::stream::global.cpu_dispatch(^() {
+          cpu_mul(A, B, C);
+          });
+    }
+    else if (dev == device_type::gpu) {
+      nn::stream::global.gpu_dispatch(^() {
+          gpu_mul(A, B, C);
+          });
+    }
+  }
+
+  void sigmoid(const data_t& A, data_t& C, device_type dev)
+  {
+    if (dev == device_type::cpu) {
+      nn::stream::global.cpu_dispatch(^() {
+          cpu_sigmoid(A, C);
+          });
+    }
+    else if (dev == device_type::gpu) {
+      nn::stream::global.gpu_dispatch(^() {
+          gpu_sigmoid(A, C);
+          });
+    }
+  }
+
   void cpu_add(const data_t& A, const data_t& B, data_t& C)
   {
     if (A.dims.size() == B.dims.size()) {
@@ -282,10 +471,25 @@ namespace nn::tensor {
         C.data()[i] = A.data()[i] + B.data()[i];
       }
     } else if (B.dims.size() == 1) {
+      
+      std::cout << "add ";
+      std::cout << utils::xs2str(A.dims);
+      std::cout << utils::xs2str(B.dims);
+      std::cout << utils::xs2str(C.dims);
+      std::cout << std::endl;
+
       assert(A.dims.size() == C.dims.size());
-      assert(B.dims[0] == 1);
-      for (int64_t i = 0; i < A.size(); i++) {
-        C.data()[i] = A.data()[i] + *B.data();
+      if (B.dims[0] == 1) {
+        for (int64_t i = 0; i < A.size(); i++) {
+          C.data()[i] = A.data()[i] + *B.data();
+        }
+      } else {
+        assert(B.dims[0] == A.dims[0]);
+        assert(A.dims.size() == 2);
+
+        for (int64_t i = 0; i < A.size(); i++) {
+          C.data()[i] = A.data()[i] + B.data()[i / A.dims[1]];
+        }
       }
     } else if (A.dims.size() == 1) {
       assert(B.dims.size() == C.dims.size());
@@ -305,13 +509,13 @@ namespace nn::tensor {
     assert(false);
   }
 
-  void cpu_mul(const data_t& A, const data_t& B, data_t& C)
+  void cpu_matmul(const data_t& A, const data_t& B, data_t& C)
   {
     if (A.dims.size() == 2 && B.dims.size() == 2) {
       assert(C.dims.size() == 2);
       assert(A.dims[0] == C.dims[0]);
       assert(A.dims[1] == B.dims[0]);
-      assert(B.dims[0] == C.dims[1]);
+      assert(B.dims[1] == C.dims[1]);
       nn::cpu::gemm(A.data(), B.data(), C.data(), C.dims[0], A.dims[1], C.dims[1]);
     } else if (A.dims.size() == 1 && B.dims.size() == 1) {
       assert(C.dims.size() == 1);
@@ -328,13 +532,13 @@ namespace nn::tensor {
     }
   }
 
-  void gpu_mul(const data_t& A, const data_t& B, data_t& C)
+  void gpu_matmul(const data_t& A, const data_t& B, data_t& C)
   {
     if (A.dims.size() == 2 && B.dims.size() == 2) {
       assert(C.dims.size() == 2);
       assert(A.dims[0] == C.dims[0]);
       assert(A.dims[1] == B.dims[0]);
-      assert(B.dims[0] == C.dims[1]);
+      assert(B.dims[1] == C.dims[1]);
       nn::gpu::gemm(stream::global.cmd, A.xs, B.xs, C.xs, C.dims[0], A.dims[1], C.dims[1]);
     } else if (A.dims.size() == 1 && B.dims.size() == 1) {
       assert(C.dims.size() == 1);
@@ -350,9 +554,87 @@ namespace nn::tensor {
       assert(false);
     }
   }
+
+  void cpu_sigmoid(const data_t& A, data_t& C)
+  {
+    assert(A.size() == C.size());
+    for (auto i = 0; i < A.size(); i++) {
+      C.data()[i] = 1.0 / (1.0 + exp(-A.data()[i]));
+    }
+  }
+
+  void gpu_sigmoid(const data_t& A, data_t& C)
+  {
+    printf("no gpu add\n");
+    assert(false);
+  }
+
+  void cpu_mul(const data_t& A, const data_t& B, data_t& C)
+  {
+    if (A.dims.size() == B.dims.size()) {
+      assert(A.dims.size() == C.dims.size());
+      assert(A.size() == C.size());
+      assert(A.size() == B.size());
+      for (uint i = 0; i < A.size(); i++) {
+        C.data()[i] = A.data()[i] * B.data()[i];
+      }
+    } else if (B.dims.size() == 1) {
+      assert(B.size() == 1);
+      assert(A.size() == C.size());
+      assert(A.dims.size() == C.dims.size());
+      for (uint i = 0; i < A.size(); i++) {
+        C.data()[i] = A.data()[i] * B.data()[0];
+      }
+    } else {
+      assert(false);
+    }
+  }
+
+  void gpu_mul(const data_t& A, const data_t& B, data_t& C)
+  {
+    printf("no gpu add\n");
+    assert(false);
+  }
 }
 
+namespace nn::tensor {
+void data_t::transpose() {
+  assert(dims.size() == 2);
+  auto tstorage = [gpu::device newBufferWithLength:size() * sizeof(float) options:MTLResourceStorageModeShared];
+  nn::cpu::transpose<1>(data(), (float*)[tstorage contents], dims[0], dims[1]);
+  xs = tstorage;
+  std::swap(dims[0], dims[1]);
+}
+}
 
+namespace nn::helpers {
+  tensor::data_t& forward(std::vector<nn::layer::linear>& model, tensor::data_t& input)
+  {
+    auto output = &input;
+    for (auto& l : model) {
+      output = &l.forward(*output);
+    }
+    return *output; 
+  }
+
+  template<typename dims_t>
+    // 784 100 10
+    std::vector<nn::layer::linear> buildModel(dims_t dims)
+    {
+      std::vector<nn::layer::linear> model;
+      for (uint i = 0; i < dims.size() - 1; i++) {
+        model.emplace_back(dims.at(i), dims.at(i + 1));
+      }
+      return model;
+    }
+}
+
+namespace nn::cost {
+  tensor::data_t quadratic(std::vector<nn::layer::linear>& model, const tensor::data_t& inputs, const tensor::data_t& outputs)
+  {
+    
+  }
+}
 
 
 
