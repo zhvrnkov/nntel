@@ -143,6 +143,15 @@ namespace nn {
     tensor::data_t quadratic(std::vector<nn::layer::linear>& model, const tensor::data_t& inputs, const tensor::data_t& outputs);
   }
 
+  namespace allocator {
+    using Buffer = id<MTLBuffer>;
+    // in bytes
+    constexpr uint64_t alignment = 4 * 4;
+
+    Buffer aligned_alloc(size_t size);
+    void free(Buffer buff);
+  }
+
   namespace cpu {
     dispatch_queue_t queue = dispatch_queue_create("nntel", NULL);
 
@@ -629,6 +638,13 @@ namespace nn::helpers {
     }
 }
 
+namespace nn::allocator {
+  using Buffer = id<MTLBuffer>;
+  // in bytes
+  Buffer aalloc(uint64_t size);
+  void free(Buffer buff);
+}
+
 namespace nn::cost {
   tensor::data_t quadratic(std::vector<nn::layer::linear>& model, const tensor::data_t& inputs, const tensor::data_t& outputs)
   {
@@ -741,20 +757,24 @@ namespace nn::cpu {
           // iterating over ks, this is outer loop, so block_C contain partial dot products
           for (int k = 0; k < N; k += 1) {
             for (int yb = 0; yb < BLOCK_Y; yb++) {
+              if (y + yb >= M) break;
               // A[y * N + yb * N + k]... is in cache now, but yb is strided by N.
               // is that a problem for L1 cache?
               // if BLOCK_Y is 4, then 32KB of A is used for this K loop
               float tA = block_A[yb * N + k];
               for (int xb = 0; xb < BLOCK_X; xb++) {
+                if (x + xb >= P) break;
                 // B[x * N + xb * N + k] we go through xb with stride N
                 // so whole B for 0<=xb<4 is in cache?
-                block_C[yb * BLOCK_X + xb] += tA * block_B[xb * N + k];     
+                block_C[yb * BLOCK_X + xb] += tA * block_B[xb * N + k];
               }
             }
           }
 
           for (int yb = 0; yb < BLOCK_Y; yb++) {
+            if (y + yb >= M) break;
             for (int xb = 0; xb < BLOCK_X; xb++) {
+              if (x + xb >= P) break;
               C[y * P + yb * P + x + xb] = block_C[yb * BLOCK_X + xb];
             }
           }

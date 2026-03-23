@@ -150,7 +150,7 @@ int main()
     auto output = nn::helpers::forward(layers, samples.first);
     nn::stream::global.synchronize();
     std::cout << "model output = " << nn::utils::xs2str(output.dims) << std::endl;
-    // output.transpose();
+    output.transpose();
 
 
 
