@@ -48,22 +48,35 @@ std::pair<nn::tensor::data_t, nn::tensor::data_t> mnistData(const std::string pa
   std::vector<int64_t> output_vectors_dims = {0, 10};
   std::vector<nn::tensor::data_t> input_images;
 
+  // Sort directories to ensure consistent ordering
+  std::vector<fs::path> directories;
   for (const auto& entry : fs::directory_iterator(path)) {
     if (fs::is_directory(entry.path())) {
-      auto dirName = entry.path().filename().string();
-      auto dirNameNumber = std::atoi(dirName.data());
+      directories.push_back(entry.path());
+    }
+  }
+  std::sort(directories.begin(), directories.end());
 
-      std::vector<float> netOutput(10);
-      netOutput[dirNameNumber] = 1.0;
+  for (const auto& dirPath : directories) {
+    auto dirName = dirPath.filename().string();
+    auto dirNameNumber = std::atoi(dirName.data());
 
-      for (const auto& imageEntry : fs::directory_iterator(entry.path())) {
-        const auto& path = imageEntry.path();
-        auto image = grayscale_image(path.string());
-        input_images.push_back(image);
+    std::vector<float> netOutput(10);
+    netOutput[dirNameNumber] = 1.0;
 
-        output_vectors.insert(output_vectors.end(), netOutput.begin(), netOutput.end());
-        output_vectors_dims.at(0) += 1;
-      }
+    // Sort files within each directory to ensure consistent ordering
+    std::vector<fs::path> files;
+    for (const auto& imageEntry : fs::directory_iterator(dirPath)) {
+      files.push_back(imageEntry.path());
+    }
+    std::sort(files.begin(), files.end());
+
+    for (const auto& imagePath : files) {
+      auto image = grayscale_image(imagePath.string());
+      input_images.push_back(image);
+
+      output_vectors.insert(output_vectors.end(), netOutput.begin(), netOutput.end());
+      output_vectors_dims.at(0) += 1;
     }
   }
 
@@ -100,7 +113,7 @@ bool load_model(std::vector<nn::layer::linear>& layers, const std::string& filen
         ifs.read(reinterpret_cast<char*>(&w_rows), sizeof(w_rows));
         ifs.read(reinterpret_cast<char*>(&w_cols), sizeof(w_cols));
         auto weights = nn::tensor::data_t::zero({(int64_t)w_rows, (int64_t)w_cols});
-        
+
         ifs.read(reinterpret_cast<char*>(weights.data()), weights.size() * sizeof(float));
 
         // Biases
@@ -122,16 +135,14 @@ int main()
   std::vector<nn::layer::linear> layers;
   load_model(layers, "/Users/vz/Developer/learn/informatics/ml/nn-sandbox/ml-logic-gates/mnist.net");
 
-  std::cout << layers.size() << std::endl;
-
   auto image = test::grayscale_image("./assets/mnist_png/testing/3/1020.png");
   image.flatten();
 
   using namespace nn::tensor;
 
   nn::tensor::data_t& output = nn::helpers::forward(layers, image);
-
   nn::stream::global.synchronize();
+
   auto max_idx = 0;
   for (auto i = 1; i < output.size(); i++) {
     if (output.data()[i] > output.data()[max_idx]) {
@@ -140,31 +151,10 @@ int main()
   }
 
   std::cout << max_idx << std::endl;
-
-  {
-    auto samples = test::mnistData("./assets/mnist_png/training");
-    samples.first.transpose();
-    std::cout << "inputs = " << nn::utils::xs2str(samples.first.dims) << std::endl;
-    std::cout << "outputs = " << nn::utils::xs2str(samples.second.dims) << std::endl;
-
-    auto output = nn::helpers::forward(layers, samples.first);
-    nn::stream::global.synchronize();
-    std::cout << "model output = " << nn::utils::xs2str(output.dims) << std::endl;
-    output.transpose();
-
-
-
-
-    // auto model = nn::helpers::buildModel(std::vector<int64_t>{784, 128, 10});
-    // nn::tensor::data_t& output = nn::helpers::forward(model, image);
-    // nn::stream::global.synchronize();
-    // auto max_idx = 0;
-    // for (auto i = 1; i < output.size(); i++) {
-    //   if (output.data()[i] > output.data()[max_idx]) {
-    //     max_idx = i;
-    //   }
-    // }
-    // std::cout << max_idx << std::endl;
-  }
+  auto samples = test::mnistData("./assets/mnist_png/testing");
+  samples.first.transpose();
+  auto cost = nn::cost::quadratic(layers, samples.first, samples.second);
+  nn::stream::global.synchronize();
+  std::cout << "cost = " << *cost.data() << std::endl;
 }
 

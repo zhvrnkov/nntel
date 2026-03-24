@@ -3,6 +3,7 @@
 #include <MacTypes.h>
 #include <iostream>
 #include <sstream>
+#include <type_traits>
 #include <vector>
 #include <random>
 #include <algorithm>
@@ -79,16 +80,22 @@ namespace nn {
       }
 
       void transpose();
+
+      data_t copy() const;
     };
 
     enum class device_type {
       cpu,
       gpu
     };
-    void matmul(const data_t& A, const data_t& B, data_t& C, device_type dev=device_type::cpu);
-    void add(const data_t& A, const data_t& B, data_t& C, device_type dev=device_type::cpu);
-    void mul(const data_t& A, const data_t& B, data_t& C, device_type dev=device_type::cpu);
-    void sigmoid(const data_t& A, data_t& C, device_type=device_type::cpu);
+    void matmul(const data_t A, const data_t B, data_t C, device_type dev=device_type::cpu);
+    void add(const data_t A, const data_t B, data_t C, float a=1.0, float b=1.0, device_type dev=device_type::cpu);
+    void sub(const data_t A, const data_t B, data_t C, device_type dev=device_type::cpu);
+    void mul(const data_t A, const data_t B, data_t C, device_type dev=device_type::cpu);
+    void div(const data_t A, const data_t B, data_t C, device_type dev=device_type::cpu);
+    void sigmoid(const data_t A, data_t C, device_type=device_type::cpu);
+
+    void sum(const data_t A, data_t C, device_type dev=device_type::cpu);
   }
 
   namespace layer {
@@ -123,7 +130,7 @@ namespace nn {
           }
           output = tensor::data_t::zero(dims);
         }
-        matmul(weights, input, output);
+        matmul(weights, input, output, tensor::device_type::cpu);
         add(output, biases, output);
         sigmoid(output, output);
         return output;
@@ -140,15 +147,23 @@ namespace nn {
   }
 
   namespace cost {
-    tensor::data_t quadratic(std::vector<nn::layer::linear>& model, const tensor::data_t& inputs, const tensor::data_t& outputs);
+    tensor::data_t quadratic(
+        std::vector<nn::layer::linear>& model, 
+        tensor::data_t& inputs, 
+        const tensor::data_t& outputs
+        );
   }
 
   namespace allocator {
-    using Buffer = id<MTLBuffer>;
+    struct Buffer {
+      id<MTLBuffer> mtl;
+      std::vector<int64_t> shape;
+    };
     // in bytes
-    constexpr uint64_t alignment = 4 * 4;
+    constexpr uint64_t alignment = 64;
 
-    Buffer aligned_alloc(size_t size);
+    template<typename shape_t>
+    Buffer aligned_alloc(shape_t shape);
     void free(Buffer buff);
   }
 
@@ -168,6 +183,7 @@ namespace nn {
     void dot(const float* x, const float* y, float* output, int64_t N);
 
     void add(const float* x, const float* y, float* output, int64_t N);
+    void sub(const float* x, const float* y, float* output, int64_t N);
   }
 
   namespace gpu {
@@ -177,6 +193,7 @@ namespace nn {
     void gemv(id<MTLCommandBuffer> cmd, id<MTLBuffer> mat, id<MTLBuffer> vec, id<MTLBuffer> out,
         uint64_t m, uint64_t n);
     void dot(id<MTLCommandBuffer> cmd, id<MTLBuffer> X, id<MTLBuffer> Y, id<MTLBuffer> output);
+    void sum(id<MTLCommandBuffer> cmd, id<MTLBuffer> X, float y, id<MTLBuffer> output);
 
     auto device = MTLCreateSystemDefaultDevice();
     auto queue = [device newCommandQueue];
@@ -221,7 +238,7 @@ namespace nn {
         last_id = 0;
       }
 
-      void cpu_dispatch(void (^block)())
+      void cpu_dispatch(std::function<void()> block)
       {
         // printf("cpu_dispatch w8=%llu curr=%llu sig=%llu\n", last_id, event.signaledValue, last_id + 1);
         [event notifyListener:listener atValue:last_id block:^(id<MTLSharedEvent> _Nonnull _event, uint64_t _value) {
@@ -231,7 +248,7 @@ namespace nn {
         last_id += 1;
       }
 
-      void gpu_dispatch(void (^block)())
+      void gpu_dispatch(std::function<void()> block)
       {
         // printf("gpu_dispatch w8=%llu curr=%llu sig=%llu\n", last_id, event.signaledValue, last_id + 1);
         [cmd encodeWaitForEvent:event value:last_id];
@@ -314,24 +331,30 @@ namespace nn::tensor {
 
   std::mt19937 gen{};
 
-  void cpu_matmul(const data_t& A, const data_t& B, data_t& C);
-  void gpu_matmul(const data_t& A, const data_t& B, data_t& C);
+  void cpu_matmul(const data_t A, const data_t B, data_t C);
+  void gpu_matmul(const data_t A, const data_t B, data_t C);
 
-  void cpu_add(const data_t& A, const data_t& B, data_t& C);
-  void gpu_add(const data_t& A, const data_t& B, data_t& C);
+  void cpu_add(const data_t A, const data_t B, data_t C, float a, float b);
+  void gpu_add(const data_t A, const data_t B, data_t C, float a, float b);
 
-  void cpu_mul(const data_t& A, const data_t& B, data_t& C);
-  void gpu_mul(const data_t& A, const data_t& B, data_t& C);
+  void cpu_mul(const data_t A, const data_t B, data_t C);
+  void gpu_mul(const data_t A, const data_t B, data_t C);
 
-  void cpu_sigmoid(const data_t& A, data_t& C);
-  void gpu_sigmoid(const data_t& A, data_t& C);
+  void cpu_div(const data_t A, const data_t B, data_t C);
+  void gpu_div(const data_t A, const data_t B, data_t C);
+
+  void cpu_sigmoid(const data_t A, data_t C);
+  void gpu_sigmoid(const data_t A, data_t C);
+
+  void cpu_sum(const data_t A, data_t C);
+  void gpu_sum(const data_t A, data_t C);
 
   data_t data_t::value(std::initializer_list<float> list)
   {
     auto size = list.size() * sizeof(float);
     auto storage = [gpu::device newBufferWithBytes:(const void*)list.begin() length:size options:MTLResourceStorageModeShared];
 
-    data_t out {{(int64_t)size}, storage};
+    data_t out {{(int64_t)list.size()}, storage};
     return out;
   }
 
@@ -416,109 +439,150 @@ namespace nn::tensor {
     return out;
   }
 
-  void matmul(const data_t& A, const data_t& B, data_t& C, device_type dev)
+  void matmul(const data_t A, const data_t B, data_t C, device_type dev)
   {
     if (dev == device_type::cpu) {
-      nn::stream::global.cpu_dispatch(^() {
+      nn::stream::global.cpu_dispatch([=] {
           cpu_matmul(A, B, C);
       });
     }
     else if (dev == device_type::gpu) {
-      nn::stream::global.gpu_dispatch(^() {
+      nn::stream::global.gpu_dispatch([=] {
           gpu_matmul(A, B, C);
       });
     }
   }
 
-  void add(const data_t& A, const data_t& B, data_t& C, device_type dev)
+  void add(const data_t A, const data_t B, data_t C, float a, float b, device_type dev)
   {
     if (dev == device_type::cpu) {
-      nn::stream::global.cpu_dispatch(^() {
-          cpu_add(A, B, C);
+      nn::stream::global.cpu_dispatch([=] {
+          cpu_add(A, B, C, a, b);
           });
     }
     else if (dev == device_type::gpu) {
-      nn::stream::global.gpu_dispatch(^() {
-          gpu_add(A, B, C);
+      nn::stream::global.gpu_dispatch([=] {
+          gpu_add(A, B, C, a, b);
           });
     }
   }
 
-  void mul(const data_t& A, const data_t& B, data_t& C, device_type dev)
+  void mul(const data_t A, const data_t B, data_t C, device_type dev)
   {
     if (dev == device_type::cpu) {
-      nn::stream::global.cpu_dispatch(^() {
+      nn::stream::global.cpu_dispatch([=] {
           cpu_mul(A, B, C);
           });
     }
     else if (dev == device_type::gpu) {
-      nn::stream::global.gpu_dispatch(^() {
+      nn::stream::global.gpu_dispatch([=] {
           gpu_mul(A, B, C);
           });
     }
   }
 
-  void sigmoid(const data_t& A, data_t& C, device_type dev)
+  void div(const data_t A, const data_t B, data_t C, device_type dev)
   {
     if (dev == device_type::cpu) {
-      nn::stream::global.cpu_dispatch(^() {
+      nn::stream::global.cpu_dispatch([=] {
+          cpu_div(A, B, C);
+          });
+    }
+    else if (dev == device_type::gpu) {
+      nn::stream::global.gpu_dispatch([=] {
+          gpu_div(A, B, C);
+          });
+    }
+  }
+
+  void sigmoid(const data_t A, data_t C, device_type dev)
+  {
+    if (dev == device_type::cpu) {
+      nn::stream::global.cpu_dispatch([=] {
           cpu_sigmoid(A, C);
           });
     }
     else if (dev == device_type::gpu) {
-      nn::stream::global.gpu_dispatch(^() {
+      nn::stream::global.gpu_dispatch([=] {
           gpu_sigmoid(A, C);
           });
     }
   }
 
-  void cpu_add(const data_t& A, const data_t& B, data_t& C)
+  void sub(const data_t A, const data_t B, data_t C, device_type dev)
+  {
+    nn::tensor::add(A, B, C, 1.0, -1.0, dev);
+  }
+
+  void sum(const data_t A, data_t C, device_type dev)
+  {
+    if (dev == device_type::cpu) {
+      nn::stream::global.cpu_dispatch([=] {
+          cpu_sum(A, C);
+          });
+    }
+    else if (dev == device_type::gpu) {
+      nn::stream::global.gpu_dispatch([=] {
+          gpu_sum(A, C);
+          });
+    }
+  }
+
+  void cpu_sum(const data_t A, data_t C)
+  {
+    assert(C.dims.size() == 1);
+    assert(C.dims[0] == 1);
+
+    for (int64_t i = 0; i < A.size(); i++) {
+      *C.data() += A.data()[i];
+    }
+  }
+
+  void gpu_sum(const data_t A, data_t C)
+  {
+    assert(C.dims.size() == 1);
+    assert(C.dims[0] == 1);
+  }
+
+  void cpu_add(const data_t A, const data_t B, data_t C, float a, float b)
   {
     if (A.dims.size() == B.dims.size()) {
       assert(A.dims.size() == C.dims.size());
       for (int64_t i = 0; i < A.size(); i++) {
-        C.data()[i] = A.data()[i] + B.data()[i];
+        C.data()[i] = A.data()[i] * a + B.data()[i] * b;
       }
     } else if (B.dims.size() == 1) {
-      
-      std::cout << "add ";
-      std::cout << utils::xs2str(A.dims);
-      std::cout << utils::xs2str(B.dims);
-      std::cout << utils::xs2str(C.dims);
-      std::cout << std::endl;
-
       assert(A.dims.size() == C.dims.size());
       if (B.dims[0] == 1) {
         for (int64_t i = 0; i < A.size(); i++) {
-          C.data()[i] = A.data()[i] + *B.data();
+          C.data()[i] = A.data()[i] * a + *B.data() * b;
         }
       } else {
         assert(B.dims[0] == A.dims[0]);
         assert(A.dims.size() == 2);
 
         for (int64_t i = 0; i < A.size(); i++) {
-          C.data()[i] = A.data()[i] + B.data()[i / A.dims[1]];
+          C.data()[i] = A.data()[i] * a + B.data()[i / A.dims[1]] * b;
         }
       }
     } else if (A.dims.size() == 1) {
       assert(B.dims.size() == C.dims.size());
       assert(A.dims[0] == 1);
-      for (int64_t i = 0; i < A.size(); i++) {
-        C.data()[i] = B.data()[i] + *A.data();
+      for (int64_t i = 0; i < C.size(); i++) {
+        C.data()[i] = B.data()[i] * b + *A.data() * a;
       }
     } else {
-    std::cout << B.dims.size() << std::endl;
       assert(false);
     }
   }
 
-  void gpu_add(const data_t& A, const data_t& B, data_t& C)
+  void gpu_add(const data_t A, const data_t B, data_t C, float a, float b)
   {
     printf("no gpu add\n");
     assert(false);
   }
 
-  void cpu_matmul(const data_t& A, const data_t& B, data_t& C)
+  void cpu_matmul(const data_t A, const data_t B, data_t C)
   {
     if (A.dims.size() == 2 && B.dims.size() == 2) {
       assert(C.dims.size() == 2);
@@ -541,7 +605,7 @@ namespace nn::tensor {
     }
   }
 
-  void gpu_matmul(const data_t& A, const data_t& B, data_t& C)
+  void gpu_matmul(const data_t A, const data_t B, data_t C)
   {
     if (A.dims.size() == 2 && B.dims.size() == 2) {
       assert(C.dims.size() == 2);
@@ -564,7 +628,7 @@ namespace nn::tensor {
     }
   }
 
-  void cpu_sigmoid(const data_t& A, data_t& C)
+  void cpu_sigmoid(const data_t A, data_t C)
   {
     assert(A.size() == C.size());
     for (auto i = 0; i < A.size(); i++) {
@@ -572,34 +636,61 @@ namespace nn::tensor {
     }
   }
 
-  void gpu_sigmoid(const data_t& A, data_t& C)
+  void gpu_sigmoid(const data_t A, data_t C)
   {
     printf("no gpu add\n");
     assert(false);
   }
 
-  void cpu_mul(const data_t& A, const data_t& B, data_t& C)
+  void cpu_mul(const data_t A, const data_t B, data_t C)
   {
-    if (A.dims.size() == B.dims.size()) {
+    // Check for scalar multiplication first
+    if (B.dims.size() == 1 && B.size() == 1) {
+      assert(A.size() == C.size());
+      assert(A.dims.size() == C.dims.size());
+      for (uint i = 0; i < A.size(); i++) {
+        C.data()[i] = A.data()[i] * B.data()[0];
+      }
+    } else if (A.dims.size() == B.dims.size()) {
       assert(A.dims.size() == C.dims.size());
       assert(A.size() == C.size());
       assert(A.size() == B.size());
       for (uint i = 0; i < A.size(); i++) {
         C.data()[i] = A.data()[i] * B.data()[i];
       }
-    } else if (B.dims.size() == 1) {
-      assert(B.size() == 1);
+    } else {
+      assert(false);
+    }
+  }
+
+  void gpu_mul(const data_t A, const data_t B, data_t C)
+  {
+    printf("no gpu add\n");
+    assert(false);
+  }
+
+  void cpu_div(const data_t A, const data_t B, data_t C)
+  {
+    // Check for scalar multiplication first
+    if (B.dims.size() == 1 && B.size() == 1) {
       assert(A.size() == C.size());
       assert(A.dims.size() == C.dims.size());
       for (uint i = 0; i < A.size(); i++) {
-        C.data()[i] = A.data()[i] * B.data()[0];
+        C.data()[i] = A.data()[i] / B.data()[0];
+      }
+    } else if (A.dims.size() == B.dims.size()) {
+      assert(A.dims.size() == C.dims.size());
+      assert(A.size() == C.size());
+      assert(A.size() == B.size());
+      for (uint i = 0; i < A.size(); i++) {
+        C.data()[i] = A.data()[i] / B.data()[i];
       }
     } else {
       assert(false);
     }
   }
 
-  void gpu_mul(const data_t& A, const data_t& B, data_t& C)
+  void gpu_div(const data_t A, const data_t B, data_t C)
   {
     printf("no gpu add\n");
     assert(false);
@@ -610,9 +701,25 @@ namespace nn::tensor {
 void data_t::transpose() {
   assert(dims.size() == 2);
   auto tstorage = [gpu::device newBufferWithLength:size() * sizeof(float) options:MTLResourceStorageModeShared];
-  nn::cpu::transpose<1>(data(), (float*)[tstorage contents], dims[0], dims[1]);
-  xs = tstorage;
+  auto oldData = xs;
+  auto old_M = dims[0];
+  auto old_N = dims[1];
   std::swap(dims[0], dims[1]);
+  xs = tstorage;
+  nn::stream::global.cpu_dispatch(^() {
+    nn::cpu::transpose<1>((float*)[oldData contents], (float*)[tstorage contents], old_M, old_N);
+  });
+}
+
+data_t data_t::copy() const {
+  auto storage = [gpu::device newBufferWithLength:[xs length] options:MTLResourceStorageModeShared];
+  data_t out{dims, storage};
+  nn::stream::global.gpu_dispatch(^() {
+    id<MTLBlitCommandEncoder> blit = [nn::stream::global.cmd blitCommandEncoder];
+    [blit copyFromBuffer:xs sourceOffset:0 toBuffer:storage destinationOffset:0 size:[storage length]];
+    [blit endEncoding];
+  });
+  return out;
 }
 }
 
@@ -639,16 +746,45 @@ namespace nn::helpers {
 }
 
 namespace nn::allocator {
-  using Buffer = id<MTLBuffer>;
   // in bytes
-  Buffer aalloc(uint64_t size);
-  void free(Buffer buff);
+  template<typename shape_t>
+  Buffer aligned_alloc(shape_t shape)
+  {
+    std::vector<int64_t> realShape = shape;
+    for (auto& s : realShape) {
+      s = alignment * (s + (alignment - 1)) / alignment;
+    }
+
+    auto length = utils::area(realShape) * sizeof(float);
+    auto mtlBuff = [gpu::device newBufferWithLength:length options:MTLResourceStorageModeShared];
+    return Buffer { mtlBuff, realShape };
+  }
+
+  void free(Buffer buff)
+  {
+    // no-op
+  }
 }
 
 namespace nn::cost {
-  tensor::data_t quadratic(std::vector<nn::layer::linear>& model, const tensor::data_t& inputs, const tensor::data_t& outputs)
+  tensor::data_t quadratic(
+    std::vector<nn::layer::linear>& model, 
+    tensor::data_t& inputs, 
+    const tensor::data_t& outputs
+  )
   {
-    
+    auto modelOutput = nn::helpers::forward(model, inputs);
+    modelOutput.transpose();
+
+    auto diff = nn::tensor::data_t::zero(modelOutput.dims);
+    auto cost = nn::tensor::data_t::value({0.0});
+
+    nn::tensor::sub(modelOutput, outputs, diff);
+    nn::tensor::mul(diff, diff, diff);
+    nn::tensor::sum(diff, cost);
+    nn::tensor::div(cost, nn::tensor::data_t::value({(float)2 * outputs.dims[0]}), cost);
+
+    return cost;
   }
 }
 
@@ -794,7 +930,7 @@ namespace nn::cpu {
 
   void dot(const float* x, const float* y, float* output, int64_t N)
   {
-    output = 0;
+    *output = 0;
     for (int64_t i = 0; i < N; i++) {
       *output += x[i] * y[i];
     }
@@ -804,6 +940,13 @@ namespace nn::cpu {
   {
     for (int64_t i = 0; i < N; i++) {
       output[i] = x[i] + y[i];
+    }
+  }
+
+  void sub(const float* x, const float* y, float* output, int64_t N)
+  {
+    for (int64_t i = 0; i < N; i++) {
+      output[i] = x[i] - y[i];
     }
   }
 }
@@ -919,6 +1062,51 @@ namespace nn::gpu {
     auto encoder = [cmd computeCommandEncoder];
     [encoder setBuffer:x offset:0 atIndex:0];
     [encoder setBuffer:y offset:0 atIndex:1];
+    [encoder setBuffer:interm offset:0 atIndex:2];
+    [encoder setBytes:(void*)&N length:sizeof(N) atIndex:3];
+    [encoder setThreadgroupMemoryLength:threadgroupMemFloats * sizeof(float) atIndex:0];
+    [encoder setComputePipelineState:kernel0];
+    [encoder dispatchThreadgroups:threadgroups threadsPerThreadgroup:threadsPerThreadgroup];
+
+    [encoder setBuffer:interm offset:0 atIndex:0];
+    [encoder setBuffer:output offset:0 atIndex:1];
+    [encoder setBytes:(void*)&threadgroupsWidth length:sizeof(threadgroupsWidth) atIndex:2];
+    [encoder setThreadgroupMemoryLength:threadgroupsWidth * sizeof(float) atIndex:0];
+    [encoder setComputePipelineState:kernel1];
+    [encoder dispatchThreads:MTLSizeMake(threadgroupsWidth, 1, 1) threadsPerThreadgroup:MTLSizeMake(threadgroupsWidth, 1, 1)];
+
+    [encoder endEncoding];
+  }
+
+  void sum(id<MTLCommandBuffer> cmd, id<MTLBuffer> X, float y, id<MTLBuffer> output)
+  {
+    assert(X.length == output.length);
+    const uint64_t N = X.length / sizeof(float);
+
+    static id<MTLComputePipelineState> kernel0;
+    static id<MTLComputePipelineState> kernel1;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        auto kernel0Func = [lib newFunctionWithName:@"sum_reduce0"];
+        auto kernel1Func = [lib newFunctionWithName:@"dot_reduce1"];
+        kernel0 = [device newComputePipelineStateWithFunction:kernel0Func error:nil];
+        kernel1 = [device newComputePipelineStateWithFunction:kernel1Func error:nil];
+        });
+    if (!kernel0 || !kernel1) {
+      NSLog(@"got error during pipeline creation");
+      return;
+    }
+
+    auto threadsPerThreadgroup = MTLSizeMake(1024, 1, 1);
+    auto threadgroupMemFloats = 1024 * 2;
+    auto floatsPerThreadgroup = threadgroupMemFloats * 4;
+    auto threadgroupsWidth = N / floatsPerThreadgroup;
+    auto threadgroups = MTLSizeMake(threadgroupsWidth, 1, 1);
+    id<MTLBuffer> interm = [device newBufferWithLength:threadgroups.width * sizeof(float) options:MTLResourceStorageModePrivate];
+
+    auto encoder = [cmd computeCommandEncoder];
+    [encoder setBuffer:X offset:0 atIndex:0];
+    [encoder setBytes:(void*)&y length:sizeof(y) atIndex:1];
     [encoder setBuffer:interm offset:0 atIndex:2];
     [encoder setBytes:(void*)&N length:sizeof(N) atIndex:3];
     [encoder setThreadgroupMemoryLength:threadgroupMemFloats * sizeof(float) atIndex:0];

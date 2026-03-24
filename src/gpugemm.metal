@@ -199,3 +199,33 @@ kernel void dot_reduce1(
     
     output[0] = shared[0];
 }
+
+kernel void sum_reduce0(
+                   const device float4* X,
+                   constant const float& y,
+                   device float* output,
+                   constant const uint64_t& N,
+                   threadgroup float* shared,
+                   uint gid [[thread_position_in_grid]],
+                   uint lid [[thread_position_in_threadgroup]],
+                   uint group_id [[threadgroup_position_in_grid]],
+                   uint group_size [[threads_per_threadgroup]],
+                   uint groups [[threadgroups_per_grid]]
+                   )
+{
+    // sim_sum???
+    shared[lid] = dot(X[(group_id * group_size + lid)], y);
+    X += groups * group_size;
+    shared[group_size + lid] = dot(X[(group_id * group_size + lid)], y);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint offset = group_size; offset > 0; offset = offset >> 1) {
+        if (lid < offset) {
+            shared[lid] += shared[lid + offset];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    
+    if (lid == 0) output[group_id] = shared[0];
+}
+
