@@ -63,26 +63,27 @@ namespace nn {
       , strides(computeStrides(shape))
       {}
 
-      float& operator[](std::vector<int64_t> idxs) {
-        assert(idxs.size() == strides.size());
+      int64_t idx_dot(const std::vector<int64_t>& idxs) const {
         int64_t idx = 0;
-
         for (uint64_t i = 0; i < idxs.size(); i++) {
           idx += idxs[i] * strides[i];
         }
-        return data[idx];
+        return idx;
+      }
+
+
+      float& operator[](std::vector<int64_t> idxs) {
+        assert(idxs.size() == strides.size());
+        return data[idx_dot(idxs)];
       }
 
       std::span<float> row(std::vector<int64_t> idxs) {
         assert((idxs.size() + 1) == strides.size());
-        int64_t idx = 0;
-        for (uint64_t i = 0; i < idxs.size(); i++) {
-          idx += idxs[i] * strides[i];
-        }
-        return {data + idx, (size_t)shape.back()};
+        return {data + idx_dot(idxs), (size_t)shape.back()};
       }
 
-      std::vector<int64_t> idxs(int64_t flatIdx) {
+      std::vector<int64_t> idxs(const std::vector<int64_t>& shape, int64_t flatIdx) const {
+        auto strides = computeStrides(shape);
         std::vector<int64_t> output(shape.size());
         int64_t remaining = flatIdx;
         for (uint64_t i = 0; i < shape.size(); i++) {
@@ -92,14 +93,15 @@ namespace nn {
         return output;
       }
 
-      void rowsIter(std::vector<int64_t> shape, std::function<void(std::span<float>)> action) {
+      void rowsIter(std::vector<int64_t> shape, std::function<void(int64_t idx)> action) const {
         uint idx = 0;
         auto a = utils::area(shape);
 
         while (idx < a) {
-          auto rowIdx = idxs(idx);
+          auto rowIdx = idxs(shape, idx);
           rowIdx.pop_back();
-          action(row(rowIdx));
+          auto fidx = idx_dot(rowIdx);
+          for (auto i = 0; i < shape.back(); i++) action(fidx + i);
           idx += shape.back();
         }
       }
@@ -126,7 +128,7 @@ namespace nn {
       }
 
     };
-    constexpr uint64_t alignment = 1;
+    constexpr uint64_t alignment = 64;
 
     template<typename shape_t>
     Buffer aligned_alloc(shape_t shape);
@@ -184,15 +186,13 @@ namespace nn {
         this->dims = dims;
       }
 
-      void flatten() {
-        this->dims = {size()};
-      }
+      void flatten();
 
       void transpose();
 
       data_t copy() const;
 
-      void rowsIter(std::function<void(std::span<float>)> f) {
+      void rowsIter(std::function<void(int64_t)> f) const {
         xs.dspan.rowsIter(dims, f);
       }
     };
@@ -243,7 +243,7 @@ namespace nn {
           }
           output = tensor::data_t::zero(dims);
         }
-        matmul(weights, input, output, tensor::device_type::cpu);
+        matmul(weights, input, output, tensor::device_type::gpu);
         add(output, biases, output);
         sigmoid(output, output);
         return output;
@@ -458,7 +458,7 @@ namespace nn::tensor {
     uint idx = 0;
     auto a = utils::area(shape);
     while (idx < a) {
-      auto rowIdx = srcSpan.idxs(idx);
+      auto rowIdx = srcSpan.idxs(shape, idx);
       rowIdx.pop_back();
       auto drow = dst.row(rowIdx);
       auto srow = srcSpan.row(rowIdx);
@@ -563,12 +563,14 @@ namespace nn::tensor {
     // Zero the entire buffer first (including padding)
     memset(storage.data, 0, utils::area(storage.dspan.shape) * sizeof(float));
 
-    // Create temporary buffer and concatenate data
     auto area = utils::area(dims);
     std::vector<float> tmp(area);
     uint64_t i = 0;
     for (auto& x : xs) {
-      memcpy(tmp.data() + singleSize * i, x.data(), x.size() * sizeof(float));
+      int64_t j = 0;
+      x.rowsIter([&](int64_t srcIdx) {
+        tmp[singleSize * i + j++] = x.data()[srcIdx];
+      });
       i += 1;
     }
     nn::tensor::copy(storage, tmp.data(), dims);
@@ -671,9 +673,9 @@ namespace nn::tensor {
     assert(C.dims.size() == 1);
     assert(C.dims[0] == 1);
 
-    for (int64_t i = 0; i < A.size(); i++) {
+    A.rowsIter([&](auto i) {
       *C.data() += A.data()[i];
-    }
+    });
   }
 
   void gpu_sum(const data_t A, data_t C)
@@ -685,30 +687,32 @@ namespace nn::tensor {
   void cpu_add(const data_t A, const data_t B, data_t C, float a, float b)
   {
     if (A.dims.size() == B.dims.size()) {
+      // element-wise add
       assert(A.dims.size() == C.dims.size());
-      for (int64_t i = 0; i < A.size(); i++) {
+      C.rowsIter([&](int64_t i) {
         C.data()[i] = A.data()[i] * a + B.data()[i] * b;
-      }
+      });
     } else if (B.dims.size() == 1) {
       assert(A.dims.size() == C.dims.size());
       if (B.dims[0] == 1) {
-        for (int64_t i = 0; i < A.size(); i++) {
+        // [] = [] + x
+        C.rowsIter([&](int64_t i) {
           C.data()[i] = A.data()[i] * a + *B.data() * b;
-        }
+        });
       } else {
         assert(B.dims[0] == A.dims[0]);
         assert(A.dims.size() == 2);
 
-        for (int64_t i = 0; i < A.size(); i++) {
-          C.data()[i] = A.data()[i] * a + B.data()[i / A.dims[1]] * b;
-        }
+        C.rowsIter([&](int64_t i) {
+          C.data()[i] = A.data()[i] * a + B.data()[i / A.xs.dspan.shape[1]] * b;
+        });
       }
     } else if (A.dims.size() == 1) {
       assert(B.dims.size() == C.dims.size());
       assert(A.dims[0] == 1);
-      for (int64_t i = 0; i < C.size(); i++) {
+      C.rowsIter([&](int64_t i) {
         C.data()[i] = B.data()[i] * b + *A.data() * a;
-      }
+      });
     } else {
       assert(false);
     }
@@ -727,7 +731,7 @@ namespace nn::tensor {
       assert(A.dims[0] == C.dims[0]);
       assert(A.dims[1] == B.dims[0]);
       assert(B.dims[1] == C.dims[1]);
-      nn::cpu::gemm(A.data(), B.data(), C.data(), C.dims[0], A.dims[1], C.dims[1]);
+      nn::cpu::gemm(A.data(), B.data(), C.data(), C.rshape()[0], A.rshape()[1], C.rshape()[1]);
     } else if (A.dims.size() == 1 && B.dims.size() == 1) {
       assert(C.dims.size() == 1);
       assert(A.dims[0] == B.dims[0]);
@@ -737,7 +741,7 @@ namespace nn::tensor {
       assert(C.dims.size() == 1);
       assert(C.dims[0] == A.dims[0]);
       assert(B.dims[0] == A.dims[1]);
-      nn::cpu::gemv(A.data(), B.data(), C.data(), A.dims[0], A.dims[1]);
+      nn::cpu::gemv(A.data(), B.data(), C.data(), A.rshape()[0], A.rshape()[1]);
     } else {
       assert(false);
     }
@@ -750,7 +754,7 @@ namespace nn::tensor {
       assert(A.dims[0] == C.dims[0]);
       assert(A.dims[1] == B.dims[0]);
       assert(B.dims[1] == C.dims[1]);
-      nn::gpu::gemm(stream::global.cmd, A.xs.mtl, B.xs.mtl, C.xs.mtl, C.dims[0], A.dims[1], C.dims[1]);
+      nn::gpu::gemm(stream::global.cmd, A.xs.mtl, B.xs.mtl, C.xs.mtl, C.rshape()[0], A.rshape()[1], C.rshape()[1]);
     } else if (A.dims.size() == 1 && B.dims.size() == 1) {
       assert(C.dims.size() == 1);
       assert(A.dims[0] == B.dims[0]);
@@ -760,7 +764,7 @@ namespace nn::tensor {
       assert(C.dims.size() == 1);
       assert(C.dims[0] == A.dims[0]);
       assert(B.dims[0] == A.dims[1]);
-      nn::gpu::gemv(stream::global.cmd, A.xs.mtl, B.xs.mtl, C.xs.mtl, A.dims[0], A.dims[1]);
+      nn::gpu::gemv(stream::global.cmd, A.xs.mtl, B.xs.mtl, C.xs.mtl, A.rshape()[0], A.rshape()[1]);
     } else {
       assert(false);
     }
@@ -769,10 +773,9 @@ namespace nn::tensor {
   void cpu_sigmoid(const data_t A, data_t C)
   {
     assert(A.size() == C.size());
-    std::println("{} {} {} {}", A.dims, C.dims, A.xs.dspan.shape, C.xs.dspan.shape);
-    for (auto i = 0; i < A.size(); i++) {
-      C.data()[i] = 1.0 / (1.0 + exp(-A.data()[i]));
-    }
+    A.rowsIter([&](int64_t idx) {
+      C.data()[idx] = 1.0 / (1.0 + exp(-A.data()[idx]));
+    });
   }
 
   void gpu_sigmoid(const data_t A, data_t C)
@@ -787,16 +790,17 @@ namespace nn::tensor {
     if (B.dims.size() == 1 && B.size() == 1) {
       assert(A.size() == C.size());
       assert(A.dims.size() == C.dims.size());
-      for (uint i = 0; i < A.size(); i++) {
+      C.rowsIter([&](auto i) {
         C.data()[i] = A.data()[i] * B.data()[0];
-      }
+      });
     } else if (A.dims.size() == B.dims.size()) {
       assert(A.dims.size() == C.dims.size());
       assert(A.size() == C.size());
       assert(A.size() == B.size());
-      for (uint i = 0; i < A.size(); i++) {
+
+      C.rowsIter([&](auto i) {
         C.data()[i] = A.data()[i] * B.data()[i];
-      }
+      });
     } else {
       assert(false);
     }
@@ -858,6 +862,21 @@ void data_t::transpose() {
   nn::stream::global.cpu_dispatch([=]() {
     nn::cpu::transpose<1>(oldData.data, tstorage.data, old_real_M, old_real_N);
   });
+}
+
+void data_t::flatten() {
+  if (dims.size() <= 1) {
+    this->dims = {size()};
+    return;
+  }
+  auto newDims = std::vector<int64_t>{size()};
+  auto newStorage = allocator::aligned_alloc(newDims);
+  int64_t destIdx = 0;
+  rowsIter([&](int64_t srcIdx) {
+    newStorage.data[destIdx++] = xs.data[srcIdx];
+  });
+  this->dims = newDims;
+  this->xs = newStorage;
 }
 
 data_t data_t::copy() const {

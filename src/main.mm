@@ -112,17 +112,25 @@ bool load_model(std::vector<nn::layer::linear>& layers, const std::string& filen
         size_t w_rows, w_cols;
         ifs.read(reinterpret_cast<char*>(&w_rows), sizeof(w_rows));
         ifs.read(reinterpret_cast<char*>(&w_cols), sizeof(w_cols));
-        auto weights = nn::tensor::data_t::zero({(int64_t)w_rows, (int64_t)w_cols});
 
-        ifs.read(reinterpret_cast<char*>(weights.data()), weights.size() * sizeof(float));
+        // Read weights into temporary buffer first
+        std::vector<float> weight_data(w_rows * w_cols);
+        ifs.read(reinterpret_cast<char*>(weight_data.data()), weight_data.size() * sizeof(float));
+
+        // Create tensor with proper padding using copy constructor
+        auto weights = nn::tensor::data_t::copy({(int64_t)w_rows, (int64_t)w_cols}, weight_data.data());
 
         // Biases
         size_t b_rows, b_cols;
         ifs.read(reinterpret_cast<char*>(&b_rows), sizeof(b_rows));
         ifs.read(reinterpret_cast<char*>(&b_cols), sizeof(b_cols));
-        auto biases = nn::tensor::data_t::zero({(int64_t)(b_rows * b_cols)});
 
-        ifs.read(reinterpret_cast<char*>(biases.data()), biases.size() * sizeof(float));
+        // Read biases into temporary buffer first
+        std::vector<float> bias_data(b_rows * b_cols);
+        ifs.read(reinterpret_cast<char*>(bias_data.data()), bias_data.size() * sizeof(float));
+
+        // Create tensor with proper padding using copy constructor
+        auto biases = nn::tensor::data_t::copy({(int64_t)(b_rows * b_cols)}, bias_data.data());
 
         layers.push_back(nn::layer::linear{weights, biases});
     }
@@ -143,14 +151,20 @@ int main()
   nn::tensor::data_t& output = nn::helpers::forward(layers, image);
   nn::stream::global.synchronize();
 
+  // Collect output values using rowsIter to handle aligned buffers correctly
+  std::vector<float> output_values;
+  output.rowsIter([&output, &output_values](int64_t idx) {
+    output_values.push_back(output.data()[idx]);
+  });
+
   auto max_idx = 0;
-  for (auto i = 1; i < output.size(); i++) {
-    if (output.data()[i] > output.data()[max_idx]) {
+  for (size_t i = 1; i < output_values.size(); i++) {
+    if (output_values[i] > output_values[max_idx]) {
       max_idx = i;
     }
   }
 
-  std::cout << max_idx << std::endl;
+  std::cout << "Predicted digit: " << max_idx << std::endl;
   auto samples = test::mnistData("./assets/mnist_png/testing");
   samples.first.transpose();
   auto cost = nn::cost::quadratic(layers, samples.first, samples.second);

@@ -21,14 +21,30 @@ void assert_float_equal(float actual, float expected, const char* test_name) {
 
 void assert_tensor_equal(const nn::tensor::data_t& actual, const float* expected, int64_t size, const char* test_name) {
     bool passed = true;
-    for (int64_t i = 0; i < size; i++) {
-        if (std::abs(actual.data()[i] - expected[i]) >= TOLERANCE) {
-            passed = false;
-            std::cerr << "FAIL: " << test_name << " - At index " << i
-                      << " expected " << expected[i] << " but got " << actual.data()[i] << std::endl;
-            break;
+    std::vector<float> actual_values;
+
+    // Collect actual values using rowsIter to get only logical elements
+    actual.rowsIter([&actual, &actual_values](int64_t idx) {
+        actual_values.push_back(actual.data()[idx]);
+    });
+
+    // Verify we got the expected number of values
+    if (actual_values.size() != (size_t)size) {
+        passed = false;
+        std::cerr << "FAIL: " << test_name << " - Size mismatch: got " << actual_values.size()
+                  << " values but expected " << size << std::endl;
+    } else {
+        // Compare the logical values
+        for (int64_t i = 0; i < size; i++) {
+            if (std::abs(actual_values[i] - expected[i]) >= TOLERANCE) {
+                passed = false;
+                std::cerr << "FAIL: " << test_name << " - At logical index " << i
+                          << " expected " << expected[i] << " but got " << actual_values[i] << std::endl;
+                break;
+            }
         }
     }
+
     if (passed) {
         tests_passed++;
     } else {
@@ -282,19 +298,21 @@ void test_sigmoid_basic() {
     nn::tensor::sigmoid(A, C, nn::tensor::device_type::cpu);
     nn::stream::global.synchronize();
 
+    float input_data[] = {-2.0f, -1.0f, 0.0f, 1.0f, 2.0f};
     float expected[5];
     for (int i = 0; i < 5; i++) {
-        expected[i] = 1.0f / (1.0f + exp(-A.data()[i]));
+        expected[i] = 1.0f / (1.0f + exp(-input_data[i]));
     }
     assert_tensor_equal(C, expected, 5, "sigmoid_basic");
 }
 
 // Test: tensor::sigmoid - 2D
 void test_sigmoid_2d() {
-    auto A = nn::tensor::data_t::copy({2, 3}, (float[]){
+    float input_data[] = {
         -1.0f, 0.0f, 1.0f,
         -0.5f, 0.5f, 2.0f
-    });
+    };
+    auto A = nn::tensor::data_t::copy({2, 3}, input_data);
     auto C = nn::tensor::data_t::zero({2, 3});
 
     nn::tensor::sigmoid(A, C, nn::tensor::device_type::cpu);
@@ -302,7 +320,7 @@ void test_sigmoid_2d() {
 
     float expected[6];
     for (int i = 0; i < 6; i++) {
-        expected[i] = 1.0f / (1.0f + exp(-A.data()[i]));
+        expected[i] = 1.0f / (1.0f + exp(-input_data[i]));
     }
     assert_tensor_equal(C, expected, 6, "sigmoid_2d");
 }
@@ -315,11 +333,17 @@ void test_sigmoid_extreme_values() {
     nn::tensor::sigmoid(A, C, nn::tensor::device_type::cpu);
     nn::stream::global.synchronize();
 
+    // Collect values using rowsIter
+    std::vector<float> values;
+    C.rowsIter([&C, &values](int64_t idx) {
+        values.push_back(C.data()[idx]);
+    });
+
     // sigmoid(-100) ≈ 0, sigmoid(100) ≈ 1
-    assert_true(C.data()[0] < 0.001f, "sigmoid_extreme_neg_10");
-    assert_true(C.data()[1] < 0.001f, "sigmoid_extreme_neg_100");
-    assert_true(C.data()[2] > 0.999f, "sigmoid_extreme_pos_10");
-    assert_true(C.data()[3] > 0.999f, "sigmoid_extreme_pos_100");
+    assert_true(values[0] < 0.001f, "sigmoid_extreme_neg_10");
+    assert_true(values[1] < 0.001f, "sigmoid_extreme_neg_100");
+    assert_true(values[2] > 0.999f, "sigmoid_extreme_pos_10");
+    assert_true(values[3] > 0.999f, "sigmoid_extreme_pos_100");
 }
 
 // Test: tensor::sum - basic 1D
@@ -366,23 +390,33 @@ void test_data_constructors() {
     // Test value constructor
     auto t1 = nn::tensor::data_t::value({1.0f, 2.0f, 3.0f});
     assert_true(t1.dims.size() == 1 && t1.dims[0] == 3, "value_constructor_dims");
-    assert_float_equal(t1.data()[0], 1.0f, "value_constructor_data_0");
-    assert_float_equal(t1.data()[1], 2.0f, "value_constructor_data_1");
-    assert_float_equal(t1.data()[2], 3.0f, "value_constructor_data_2");
+
+    std::vector<float> t1_values;
+    t1.rowsIter([&t1, &t1_values](int64_t idx) {
+        t1_values.push_back(t1.data()[idx]);
+    });
+    assert_float_equal(t1_values[0], 1.0f, "value_constructor_data_0");
+    assert_float_equal(t1_values[1], 2.0f, "value_constructor_data_1");
+    assert_float_equal(t1_values[2], 3.0f, "value_constructor_data_2");
 
     // Test zero constructor
     auto t2 = nn::tensor::data_t::zero({2, 3});
     assert_true(t2.dims.size() == 2 && t2.dims[0] == 2 && t2.dims[1] == 3, "zero_constructor_dims");
-    for (int i = 0; i < 6; i++) {
-        assert_float_equal(t2.data()[i], 0.0f, "zero_constructor_data");
-    }
+
+    int count = 0;
+    t2.rowsIter([&t2, &count](int64_t idx) {
+        assert_float_equal(t2.data()[idx], 0.0f, "zero_constructor_data");
+        count++;
+    });
+    assert_true(count == 6, "zero_constructor_count");
 
     // Test fill constructor
     auto t3 = nn::tensor::data_t::fill({4}, 7.5f);
     assert_true(t3.dims.size() == 1 && t3.dims[0] == 4, "fill_constructor_dims");
-    for (int i = 0; i < 4; i++) {
-        assert_float_equal(t3.data()[i], 7.5f, "fill_constructor_data");
-    }
+
+    t3.rowsIter([&t3](int64_t idx) {
+        assert_float_equal(t3.data()[idx], 7.5f, "fill_constructor_data");
+    });
 
     // Test size method
     assert_true(t1.size() == 3, "size_1d");
@@ -455,6 +489,116 @@ void test_zero_operations() {
     assert_tensor_equal(C, expected_zero, 3, "mul_with_zero");
 }
 
+// Test: flatten - 1D tensor (noop, just updates dims)
+void test_flatten_1d() {
+    auto A = nn::tensor::data_t::copy({5}, (float[]){1.0f, 2.0f, 3.0f, 4.0f, 5.0f});
+    A.flatten();
+
+    assert_true(A.dims.size() == 1 && A.dims[0] == 5, "flatten_1d_dims");
+    float expected[] = {1.0f, 2.0f, 3.0f, 4.0f, 5.0f};
+    assert_tensor_equal(A, expected, 5, "flatten_1d_data");
+}
+
+// Test: flatten - 2D tensor repacks data contiguously
+void test_flatten_2d() {
+    auto A = nn::tensor::data_t::copy({3, 4}, (float[]){
+        1.0f, 2.0f, 3.0f, 4.0f,
+        5.0f, 6.0f, 7.0f, 8.0f,
+        9.0f, 10.0f, 11.0f, 12.0f
+    });
+    A.flatten();
+
+    assert_true(A.dims.size() == 1 && A.dims[0] == 12, "flatten_2d_dims");
+    float expected[] = {1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 6.0f, 7.0f, 8.0f, 9.0f, 10.0f, 11.0f, 12.0f};
+    assert_tensor_equal(A, expected, 12, "flatten_2d_data");
+}
+
+// Test: flatten - 2D then use in matmul (the actual bug scenario)
+void test_flatten_2d_then_gemv() {
+    auto mat = nn::tensor::data_t::copy({2, 6}, (float[]){
+        1.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
+        0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 1.0f
+    });
+    auto img = nn::tensor::data_t::copy({2, 3}, (float[]){
+        10.0f, 20.0f, 30.0f,
+        40.0f, 50.0f, 60.0f
+    });
+    img.flatten();
+
+    auto out = nn::tensor::data_t::zero({2});
+    nn::tensor::matmul(mat, img, out, nn::tensor::device_type::cpu);
+    nn::stream::global.synchronize();
+
+    // mat[0] picks element 0 -> 10.0, mat[1] picks element 5 -> 60.0
+    float expected[] = {10.0f, 60.0f};
+    assert_tensor_equal(out, expected, 2, "flatten_2d_then_gemv");
+}
+
+// Test: flatten - verifies buffer is truly contiguous (no padding gaps)
+void test_flatten_2d_contiguous_buffer() {
+    auto A = nn::tensor::data_t::copy({2, 3}, (float[]){
+        1.0f, 2.0f, 3.0f,
+        4.0f, 5.0f, 6.0f
+    });
+    A.flatten();
+
+    // After flatten, rshape should be 1D (aligned to 64)
+    assert_true(A.rshape().size() == 1, "flatten_contiguous_rshape_ndim");
+
+    // Raw buffer positions 0..5 should be contiguous data
+    for (int i = 0; i < 6; i++) {
+        assert_float_equal(A.data()[i], (float)(i + 1), "flatten_contiguous_raw");
+    }
+}
+
+// Test: concat - 1D tensors
+void test_concat_1d() {
+    std::vector<nn::tensor::data_t> tensors;
+    tensors.push_back(nn::tensor::data_t::copy({3}, (float[]){1.0f, 2.0f, 3.0f}));
+    tensors.push_back(nn::tensor::data_t::copy({3}, (float[]){4.0f, 5.0f, 6.0f}));
+    tensors.push_back(nn::tensor::data_t::copy({3}, (float[]){7.0f, 8.0f, 9.0f}));
+
+    auto result = nn::tensor::data_t::concat(tensors);
+
+    assert_true(result.dims.size() == 2 && result.dims[0] == 3 && result.dims[1] == 3, "concat_1d_dims");
+    float expected[] = {1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 6.0f, 7.0f, 8.0f, 9.0f};
+    assert_tensor_equal(result, expected, 9, "concat_1d_data");
+}
+
+// Test: concat - 2D tensors (verifies rowsIter-based copy handles padding)
+void test_concat_2d() {
+    std::vector<nn::tensor::data_t> tensors;
+    tensors.push_back(nn::tensor::data_t::copy({2, 3}, (float[]){
+        1.0f, 2.0f, 3.0f,
+        4.0f, 5.0f, 6.0f
+    }));
+    tensors.push_back(nn::tensor::data_t::copy({2, 3}, (float[]){
+        7.0f, 8.0f, 9.0f,
+        10.0f, 11.0f, 12.0f
+    }));
+
+    auto result = nn::tensor::data_t::concat(tensors);
+
+    assert_true(result.dims.size() == 2 && result.dims[0] == 2 && result.dims[1] == 6, "concat_2d_dims");
+    float expected[] = {1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 6.0f, 7.0f, 8.0f, 9.0f, 10.0f, 11.0f, 12.0f};
+    assert_tensor_equal(result, expected, 12, "concat_2d_data");
+}
+
+// Test: concat then flatten (full pipeline like MNIST preprocessing)
+void test_concat_then_flatten() {
+    std::vector<nn::tensor::data_t> images;
+    images.push_back(nn::tensor::data_t::copy({2, 3}, (float[]){
+        1.0f, 2.0f, 3.0f,
+        4.0f, 5.0f, 6.0f
+    }));
+
+    auto batch = nn::tensor::data_t::concat(images);
+    assert_true(batch.dims[0] == 1 && batch.dims[1] == 6, "concat_then_flatten_concat_dims");
+
+    float expected[] = {1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 6.0f};
+    assert_tensor_equal(batch, expected, 6, "concat_then_flatten_data");
+}
+
 void run_all_tests() {
     std::cout << "Running CPU tensor operations tests..." << std::endl;
     std::cout << "======================================" << std::endl;
@@ -495,6 +639,17 @@ void run_all_tests() {
 
     // Constructor tests
     test_data_constructors();
+
+    // Flatten tests
+    test_flatten_1d();
+    test_flatten_2d();
+    test_flatten_2d_then_gemv();
+    test_flatten_2d_contiguous_buffer();
+
+    // Concat tests
+    test_concat_1d();
+    test_concat_2d();
+    test_concat_then_flatten();
 
     // Combined operations
     test_combined_operations();

@@ -2,11 +2,25 @@
 all: main
 
 # Test target
-test: tests/test_tensor_ops
+test: test_ops test_allocator test_ctors
+
+test_ops: tests/test_tensor_ops
 	./tests/test_tensor_ops
+
+test_allocator: tests/test_allocator
+	./tests/test_allocator
+
+test_ctors: tests/test_tensor_ctors
+	./tests/test_tensor_ctors
 
 tests/test_tensor_ops: tests/test_tensor_ops.mm src/nn.mm default.metallib
 	clang++ -std=c++23 -O3 -ffast-math -Wall -Wextra tests/test_tensor_ops.mm -framework Metal -framework Foundation -o tests/test_tensor_ops
+
+tests/test_allocator: tests/test_allocator.mm src/nn.mm default.metallib
+	clang++ -std=c++23 -O3 -ffast-math -Wall -Wextra tests/test_allocator.mm -framework Metal -framework Foundation -o tests/test_allocator
+
+tests/test_tensor_ctors: tests/test_tensor_ctors.mm src/nn.mm default.metallib
+	clang++ -std=c++23 -O3 -ffast-math -Wall -Wextra tests/test_tensor_ctors.mm -framework Metal -framework Foundation -o tests/test_tensor_ctors
 
 # Metal library target
 default.metallib: gpugemm.air
@@ -21,6 +35,6 @@ main: src/nn.mm src/main.mm default.metallib
 
 # Clean build artifacts
 clean:
-	rm -f gpugemm.air default.metallib main tests/test_tensor_ops
+	rm -f gpugemm.air default.metallib main tests/test_tensor_ops tests/test_allocator tests/test_tensor_ctors
 
-.PHONY: all clean test
+.PHONY: all clean test test_ops test_allocator test_ctors
