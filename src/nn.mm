@@ -5,9 +5,12 @@
 #include <sstream>
 #include <type_traits>
 #include <vector>
+#include <span>
 #include <random>
 #include <algorithm>
 #include <cassert>
+#include <print>
+#include <functional>
 
 #define NN_IMPL
 
@@ -38,13 +41,111 @@ namespace nn {
       }
   }
 
+  namespace allocator {
+    std::vector<int64_t> computeStrides(const std::vector<int64_t>& shape) {
+      std::vector<int64_t> strides;
+      strides.resize(shape.size());
+      int64_t stride = 1;
+      for (int64_t i = shape.size() - 1; i >= 0; --i) {
+        strides[i] = stride;
+        stride *= shape[i];
+      }
+      return strides;
+    }
+    struct ndspan {
+      float* data;
+      std::vector<int64_t> shape;
+      std::vector<int64_t> strides;
+
+      ndspan(float* data, std::vector<int64_t> shape)
+      : data(data)
+      , shape(shape)
+      , strides(computeStrides(shape))
+      {}
+
+      float& operator[](std::vector<int64_t> idxs) {
+        assert(idxs.size() == strides.size());
+        int64_t idx = 0;
+
+        for (uint64_t i = 0; i < idxs.size(); i++) {
+          idx += idxs[i] * strides[i];
+        }
+        return data[idx];
+      }
+
+      std::span<float> row(std::vector<int64_t> idxs) {
+        assert((idxs.size() + 1) == strides.size());
+        int64_t idx = 0;
+        for (uint64_t i = 0; i < idxs.size(); i++) {
+          idx += idxs[i] * strides[i];
+        }
+        return {data + idx, (size_t)shape.back()};
+      }
+
+      std::vector<int64_t> idxs(int64_t flatIdx) {
+        std::vector<int64_t> output(shape.size());
+        int64_t remaining = flatIdx;
+        for (uint64_t i = 0; i < shape.size(); i++) {
+          output[i] = remaining / strides[i];
+          remaining %= strides[i];
+        }
+        return output;
+      }
+
+      void rowsIter(std::vector<int64_t> shape, std::function<void(std::span<float>)> action) {
+        uint idx = 0;
+        auto a = utils::area(shape);
+
+        while (idx < a) {
+          auto rowIdx = idxs(idx);
+          rowIdx.pop_back();
+          action(row(rowIdx));
+          idx += shape.back();
+        }
+      }
+    };
+
+    struct Buffer {
+      id<MTLBuffer> mtl;
+      float* data;
+      ndspan dspan;
+
+      Buffer(id<MTLBuffer> mtl, std::vector<int64_t> shape)
+      : mtl(mtl)
+      , data((float*)[mtl contents])
+      , dspan(ndspan{data, shape})
+      {
+      }
+
+      float& operator[](std::vector<int64_t> idxs) {
+        return dspan[idxs];
+      }
+
+      std::span<float> row(std::vector<int64_t> idxs) {
+        return dspan.row(idxs);
+      }
+
+    };
+    constexpr uint64_t alignment = 1;
+
+    template<typename shape_t>
+    Buffer aligned_alloc(shape_t shape);
+    void free(Buffer buff);
+  }
+
+
   namespace tensor {
     struct data_t {
       std::vector<int64_t> dims;
-      id<MTLBuffer> xs;
+      allocator::Buffer xs;
 
-      data_t(std::initializer_list<int64_t> dims, id<MTLBuffer> xs) : dims(dims), xs(xs) {}
-      data_t(std::vector<int64_t> dims, id<MTLBuffer> xs) : dims(dims), xs(xs) {}
+      data_t(std::initializer_list<int64_t> dims, allocator::Buffer xs) 
+      : dims(dims)
+      , xs(xs) {}
+
+      data_t(std::vector<int64_t> dims, allocator::Buffer xs) 
+      : dims(dims)
+      , xs(xs) {}
 
       static data_t value(std::initializer_list<float> list);
 
@@ -63,11 +164,19 @@ namespace nn {
       static data_t concat(tensors xs);
 
       float* data() const {
-        return (float*)[xs contents];
+        return xs.data;
       }
 
       int64_t size() const {
         return utils::area(dims);
+      }
+
+      int64_t rsize() const {
+        return utils::area(xs.dspan.shape);
+      }
+
+      const std::vector<int64_t>& rshape() const {
+        return xs.dspan.shape;
       }
 
       template<typename dims_t>
@@ -82,6 +191,10 @@ namespace nn {
       void transpose();
 
       data_t copy() const;
+
+      void rowsIter(std::function<void(std::span<float>)> f) {
+        xs.dspan.rowsIter(dims, f);
+      }
     };
 
     enum class device_type {
@@ -152,19 +265,6 @@ namespace nn {
         tensor::data_t& inputs, 
         const tensor::data_t& outputs
         );
-  }
-
-  namespace allocator {
-    struct Buffer {
-      id<MTLBuffer> mtl;
-      std::vector<int64_t> shape;
-    };
-    // in bytes
-    constexpr uint64_t alignment = 64;
-
-    template<typename shape_t>
-    Buffer aligned_alloc(shape_t shape);
-    void free(Buffer buff);
   }
 
   namespace cpu {
@@ -349,93 +449,131 @@ namespace nn::tensor {
   void cpu_sum(const data_t A, data_t C);
   void gpu_sum(const data_t A, data_t C);
 
+  void copy(allocator::Buffer dst, float* src, const std::vector<int64_t>& shape) {
+    assert(shape.size() == dst.dspan.shape.size());
+
+    auto srcSpan = allocator::ndspan(src, shape);
+
+    auto rowSize = shape.back();
+    uint idx = 0;
+    auto a = utils::area(shape);
+    while (idx < a) {
+      auto rowIdx = srcSpan.idxs(idx);
+      rowIdx.pop_back();
+      auto drow = dst.row(rowIdx);
+      auto srow = srcSpan.row(rowIdx);
+      for (auto i = 0; i < rowSize; i++) {
+        drow[i] = srow[i];
+      }
+      idx += rowSize;
+    }
+  }
+
   data_t data_t::value(std::initializer_list<float> list)
   {
-    auto size = list.size() * sizeof(float);
-    auto storage = [gpu::device newBufferWithBytes:(const void*)list.begin() length:size options:MTLResourceStorageModeShared];
+    std::vector<int64_t> dims = {(int64_t)list.size()};
+    auto storage = allocator::aligned_alloc(dims);
+    nn::tensor::copy(storage, (float*)list.begin(), dims);
 
-    data_t out {{(int64_t)list.size()}, storage};
+    data_t out {dims, storage};
     return out;
   }
 
   template<typename dims_t>
   data_t data_t::copy(dims_t dims, const float* data) {
-    auto size = utils::area(dims) * sizeof(float);
-    auto storage = [gpu::device newBufferWithBytes:(const void*)data length:size options:MTLResourceStorageModeShared];
+    auto storage = allocator::aligned_alloc(dims);
+    nn::tensor::copy(storage, (float*)data, std::vector<int64_t>(dims.begin(), dims.end()));
 
     data_t out{dims, storage};
     return out;
   }
 
   data_t data_t::copy(std::initializer_list<int64_t> dims, const float* data) {
-    auto size = utils::area(dims) * sizeof(float);
-    auto storage = [gpu::device newBufferWithBytes:(const void*)data length:size options:MTLResourceStorageModeShared];
+    auto storage = allocator::aligned_alloc(dims);
+    nn::tensor::copy(storage, (float*)data, std::vector<int64_t>(dims));
 
     data_t out{dims, storage};
     return out;
   }
 
   data_t data_t::zero(std::initializer_list<int64_t> dims) {
-    auto size = utils::area(dims) * sizeof(float);
-    auto storage = [gpu::device newBufferWithLength:size options:MTLResourceStorageModeShared];
+    auto storage = allocator::aligned_alloc(dims);
 
     data_t out{dims, storage};
-    memset(out.data(), 0, utils::area(out.dims) * sizeof(out.data()[0]));
+    memset(out.data(), 0, utils::area(storage.dspan.shape) * sizeof(float));
     return out;
   }
 
   template<typename dims_t>
     data_t data_t::zero(dims_t dims) {
-      auto size = utils::area(dims) * sizeof(float);
-      auto storage = [gpu::device newBufferWithLength:size options:MTLResourceStorageModeShared];
+      auto storage = allocator::aligned_alloc(dims);
 
       data_t out{dims, storage};
-      memset(out.data(), 0, utils::area(out.dims) * sizeof(out.data()[0]));
+      memset(out.data(), 0, utils::area(storage.dspan.shape) * sizeof(float));
       return out;
     }
 
   data_t data_t::fill(std::initializer_list<int64_t> dims, float x) {
-    auto size = utils::area(dims) * sizeof(float);
-    auto storage = [gpu::device newBufferWithLength:size options:MTLResourceStorageModeShared];
+    auto storage = allocator::aligned_alloc(dims);
+
+    // Zero the entire buffer first (including padding)
+    memset(storage.data, 0, utils::area(storage.dspan.shape) * sizeof(float));
+
+    // Fill only the logical shape
+    auto area = utils::area(dims);
+    std::vector<float> tmp(area, x);
+    nn::tensor::copy(storage, tmp.data(), std::vector<int64_t>(dims));
 
     data_t out{dims, storage};
-    for (int64_t i = 0; i < out.size(); i++) {
-      out.data()[i] = x;
-    }
     return out;
   }
 
   data_t data_t::random(std::initializer_list<int64_t> dims) {
-    auto size = utils::area(dims) * sizeof(float);
-    auto storage = [gpu::device newBufferWithLength:size options:MTLResourceStorageModeShared];
+    auto storage = allocator::aligned_alloc(dims);
+
+    // Zero the entire buffer first (including padding)
+    memset(storage.data, 0, utils::area(storage.dspan.shape) * sizeof(float));
 
     std::normal_distribution<float> dstr(0.0, 1.0);
 
-    data_t out{dims, storage};
-    auto area = utils::area(out.dims);
+    // Generate random data only for logical shape
+    auto area = utils::area(dims);
+    std::vector<float> tmp(area);
     for (auto i = 0; i < area; i++) {
-      out.data()[i] = dstr(gen);
+      tmp[i] = dstr(gen);
     }
+    nn::tensor::copy(storage, tmp.data(), std::vector<int64_t>(dims));
+
+    data_t out{dims, storage};
     return out;
   }
 
   template<typename tensors>
   data_t data_t::concat(tensors xs) {
     auto singleSize = xs.begin()->size();
-    uint64_t size = 0;
+    uint64_t count = 0;
     for (auto& x : xs) {
       assert(x.size() == singleSize);
-      size += utils::area(x.dims);
+      count++;
     }
 
-    auto storage = [gpu::device newBufferWithLength:size * sizeof(float) options:MTLResourceStorageModeShared];
+    std::vector<int64_t> dims = {(int64_t)count, singleSize};
+    auto storage = allocator::aligned_alloc(dims);
+
+    // Zero the entire buffer first (including padding)
+    memset(storage.data, 0, utils::area(storage.dspan.shape) * sizeof(float));
+
+    // Create temporary buffer and concatenate data
+    auto area = utils::area(dims);
+    std::vector<float> tmp(area);
     uint64_t i = 0;
     for (auto& x : xs) {
-      memcpy(((float*)[storage contents]) + singleSize * i, x.data(), x.size() * sizeof(float));
+      memcpy(tmp.data() + singleSize * i, x.data(), x.size() * sizeof(float));
       i += 1;
     }
+    nn::tensor::copy(storage, tmp.data(), dims);
 
-    data_t out{{(int64_t)xs.size(), singleSize}, storage};
+    data_t out{dims, storage};
     return out;
   }
 
@@ -612,17 +750,17 @@ namespace nn::tensor {
       assert(A.dims[0] == C.dims[0]);
       assert(A.dims[1] == B.dims[0]);
       assert(B.dims[1] == C.dims[1]);
-      nn::gpu::gemm(stream::global.cmd, A.xs, B.xs, C.xs, C.dims[0], A.dims[1], C.dims[1]);
+      nn::gpu::gemm(stream::global.cmd, A.xs.mtl, B.xs.mtl, C.xs.mtl, C.dims[0], A.dims[1], C.dims[1]);
     } else if (A.dims.size() == 1 && B.dims.size() == 1) {
       assert(C.dims.size() == 1);
       assert(A.dims[0] == B.dims[0]);
       assert(1 == C.dims[0]);
-      nn::gpu::dot(stream::global.cmd, A.xs, B.xs, C.xs);
+      nn::gpu::dot(stream::global.cmd, A.xs.mtl, B.xs.mtl, C.xs.mtl);
     } else if (A.dims.size() == 2 && B.dims.size() == 1) {
       assert(C.dims.size() == 1);
       assert(C.dims[0] == A.dims[0]);
       assert(B.dims[0] == A.dims[1]);
-      nn::gpu::gemv(stream::global.cmd, A.xs, B.xs, C.xs, A.dims[0], A.dims[1]);
+      nn::gpu::gemv(stream::global.cmd, A.xs.mtl, B.xs.mtl, C.xs.mtl, A.dims[0], A.dims[1]);
     } else {
       assert(false);
     }
@@ -631,6 +769,7 @@ namespace nn::tensor {
   void cpu_sigmoid(const data_t A, data_t C)
   {
     assert(A.size() == C.size());
+    std::println("{} {} {} {}", A.dims, C.dims, A.xs.dspan.shape, C.xs.dspan.shape);
     for (auto i = 0; i < A.size(); i++) {
       C.data()[i] = 1.0 / (1.0 + exp(-A.data()[i]));
     }
@@ -700,23 +839,34 @@ namespace nn::tensor {
 namespace nn::tensor {
 void data_t::transpose() {
   assert(dims.size() == 2);
-  auto tstorage = [gpu::device newBufferWithLength:size() * sizeof(float) options:MTLResourceStorageModeShared];
-  auto oldData = xs;
   auto old_M = dims[0];
   auto old_N = dims[1];
+  std::vector<int64_t> newDims = {old_N, old_M};
+
+  auto tstorage = allocator::aligned_alloc(newDims);
+
+  // Zero the entire buffer (including padding)
+  memset(tstorage.data, 0, utils::area(tstorage.dspan.shape) * sizeof(float));
+
+  auto oldData = xs;
+  auto old_real_M = xs.dspan.shape[0];
+  auto old_real_N = xs.dspan.shape[1];
+
   std::swap(dims[0], dims[1]);
   xs = tstorage;
-  nn::stream::global.cpu_dispatch(^() {
-    nn::cpu::transpose<1>((float*)[oldData contents], (float*)[tstorage contents], old_M, old_N);
+
+  nn::stream::global.cpu_dispatch([=]() {
+    nn::cpu::transpose<1>(oldData.data, tstorage.data, old_real_M, old_real_N);
   });
 }
 
 data_t data_t::copy() const {
-  auto storage = [gpu::device newBufferWithLength:[xs length] options:MTLResourceStorageModeShared];
+  auto storage = allocator::aligned_alloc(dims);
   data_t out{dims, storage};
-  nn::stream::global.gpu_dispatch(^() {
+  auto srcBuffer = xs;
+  nn::stream::global.gpu_dispatch([=]() {
     id<MTLBlitCommandEncoder> blit = [nn::stream::global.cmd blitCommandEncoder];
-    [blit copyFromBuffer:xs sourceOffset:0 toBuffer:storage destinationOffset:0 size:[storage length]];
+    [blit copyFromBuffer:srcBuffer.mtl sourceOffset:0 toBuffer:storage.mtl destinationOffset:0 size:[storage.mtl length]];
     [blit endEncoding];
   });
   return out;
@@ -752,11 +902,12 @@ namespace nn::allocator {
   {
     std::vector<int64_t> realShape = shape;
     for (auto& s : realShape) {
-      s = alignment * (s + (alignment - 1)) / alignment;
+      s = alignment * ((s + (alignment - 1)) / alignment);
     }
 
     auto length = utils::area(realShape) * sizeof(float);
     auto mtlBuff = [gpu::device newBufferWithLength:length options:MTLResourceStorageModeShared];
+    memset(mtlBuff.contents, 0, length);
     return Buffer { mtlBuff, realShape };
   }
 

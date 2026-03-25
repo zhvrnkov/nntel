@@ -6,7 +6,7 @@ test: tests/test_tensor_ops
 	./tests/test_tensor_ops
 
 tests/test_tensor_ops: tests/test_tensor_ops.mm src/nn.mm default.metallib
-	clang++ -std=c++20 -O3 -ffast-math -Wall -Wextra tests/test_tensor_ops.mm -framework Metal -framework Foundation -o tests/test_tensor_ops
+	clang++ -std=c++23 -O3 -ffast-math -Wall -Wextra tests/test_tensor_ops.mm -framework Metal -framework Foundation -o tests/test_tensor_ops
 
 # Metal library target
 default.metallib: gpugemm.air
@@ -17,7 +17,7 @@ gpugemm.air: src/gpugemm.metal
 
 # Executable target
 main: src/nn.mm src/main.mm default.metallib
-	clang++ -std=c++20 -O3 -ffast-math -Wall -Wextra src/main.mm -framework Metal -framework Foundation -o main
+	clang++ -std=c++23 -O3 -ffast-math -Wall -Wextra src/main.mm -framework Metal -framework Foundation -o main
 
 # Clean build artifacts
 clean:
