@@ -3,13 +3,11 @@
 #include <iostream>
 #include <fstream>
 #include <cassert>
+#include <simd/simd.h>
 
 #define GPU
 #define NN_IMPL
 #include "nn.mm"
-
-#define STB_IMAGE_IMPLEMENTATION
-#include "stb_image.h"
 
 namespace test {
 struct TestSample {
@@ -28,16 +26,15 @@ TestData xorTestData() {
   output.push_back({nn::tensor::data_t::value({1.0f, 1.0f}), nn::tensor::data_t::value({0.0f})});
   return output;
 }
-
 nn::tensor::data_t grayscale_image(std::string path)
 {
-    int width, height, channels;
-    auto data = stbi_loadf(path.data(), &width, &height, &channels, 0);
-    
-    auto output = nn::tensor::data_t::copy({height, width}, data);
-    
-    stbi_image_free(data);
-    return output;
+  int width, height, channels;
+  auto data = stbi_loadf(path.data(), &width, &height, &channels, 0);
+
+  auto output = nn::tensor::data_t::copy({height, width}, data);
+
+  stbi_image_free(data);
+  return output;
 }
 
 std::pair<nn::tensor::data_t, nn::tensor::data_t> mnistData(const std::string path) {
@@ -80,7 +77,9 @@ std::pair<nn::tensor::data_t, nn::tensor::data_t> mnistData(const std::string pa
     }
   }
 
-  return std::make_pair(nn::tensor::data_t::concat(input_images), nn::tensor::data_t::copy(output_vectors_dims, output_vectors.data()));
+  auto output = std::make_pair(nn::tensor::data_t::concat(input_images), nn::tensor::data_t::copy(output_vectors_dims, output_vectors.data()));
+  std::cout << nn::utils::xs2str(output.first.dims) << std::endl;
+  return output;
 }
 }
 
@@ -138,7 +137,7 @@ bool load_model(std::vector<nn::layer::linear>& layers, const std::string& filen
     return true;
 }
 
-int main()
+int main_inference()
 {
   std::vector<nn::layer::linear> layers;
   load_model(layers, "/Users/vz/Developer/learn/informatics/ml/nn-sandbox/ml-logic-gates/mnist.net");
@@ -148,7 +147,7 @@ int main()
 
   using namespace nn::tensor;
 
-  nn::tensor::data_t& output = nn::helpers::forward(layers, image);
+  nn::tensor::data_t output = nn::helpers::forward(layers, image);
   nn::stream::global.synchronize();
 
   // Collect output values using rowsIter to handle aligned buffers correctly
@@ -167,8 +166,61 @@ int main()
   std::cout << "Predicted digit: " << max_idx << std::endl;
   auto samples = test::mnistData("./assets/mnist_png/testing");
   samples.first.transpose();
-  auto cost = nn::cost::quadratic(layers, samples.first, samples.second);
+  auto cost = nn::cost::quadratic(layers, samples.first, samples.second, nullptr);
   nn::stream::global.synchronize();
   std::cout << "cost = " << *cost.data() << std::endl;
 }
 
+int main()
+{
+  auto train_loader = nn::train::data_loader{"./assets/mnist_png/training", 30, true};
+  auto test_loader = nn::train::data_loader{"./assets/mnist_png/testing", -1, false};
+
+  auto model = nn::helpers::buildModel({784, 128, 10});
+
+  auto testdata = test_loader.nextBatch();
+  test_loader.reset();
+  auto cost = nn::cost::quadratic(model, testdata->first, testdata->second, nullptr);
+  nn::stream::global.synchronize();
+  std::cout << "initial cost = " << *cost.data() << std::endl;
+
+  for (int64_t epoch = 0; epoch < 256; epoch++) {
+    train_loader.reset();
+    std::optional<std::pair<nn::tensor::data_t, nn::tensor::data_t>> batch;
+    auto bi = nn::tensor::data_t::zero({1});
+    while ((batch = train_loader.nextBatch())) {
+      // std::println("{} {}", nn::utils::xs2str(batch->first.dims), nn::utils::xs2str(batch->second.dims));
+      auto cost = nn::cost::quadratic(model, batch->first, batch->second, &bi);
+      bi.transpose();
+      for (int64_t i = model.size() - 1; i >= 0; i--) {
+        bi = model[i].backward(bi);
+      }
+      for (int64_t i = model.size() - 1; i >= 0; i--) {
+        model[i].applyGrad();
+      }
+      // nn::stream::global.synchronize();
+      // std::cout << "cost = " << *cost.data() << std::endl;
+    }
+    auto cost = nn::cost::quadratic(model, testdata->first, testdata->second, nullptr);
+    nn::stream::global.synchronize();
+    std::cout << "cost = " << *cost.data() << std::endl;
+  }
+  // for (int64_t e = 0; e < 128; e++) {
+  //   for (int64_t i = model.size() - 1; i >= 0; i--) {
+  //     bi = model[i].backward(bi);
+  //   }
+  //   for (int64_t i = model.size() - 1; i >= 0; i--) {
+  //     model[i].applyGrad();
+  //   }
+  //   cost = nn::cost::quadratic(model, samples.first, samples.second, bi);
+  //   bi.transpose();
+  //   nn::stream::global.synchronize();
+  //   std::cout << "cost = " << *cost.data() << std::endl;
+  // }
+
+  return 0;
+  
+  // for (auto i = model.size() - 1; i >= 0; i--) {
+  //   
+  // }
+}

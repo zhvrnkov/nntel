@@ -2,8 +2,10 @@
 
 #include <MacTypes.h>
 #include <iostream>
+#include <optional>
 #include <sstream>
 #include <type_traits>
+#include <filesystem>
 #include <vector>
 #include <span>
 #include <random>
@@ -16,6 +18,9 @@
 
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
+
+#define STB_IMAGE_IMPLEMENTATION
+#include "stb_image.h"
 
 namespace nn {
 
@@ -105,6 +110,42 @@ namespace nn {
           idx += shape.back();
         }
       }
+
+      void zero_validate(const std::vector<int64_t>& logical_shape) const {
+        assert(logical_shape.size() == shape.size());
+        auto realTotal = utils::area(shape);
+        auto realLastDim = shape.back();
+        auto logicalLastDim = logical_shape.back();
+
+        for (int64_t flat = 0; flat < realTotal; flat += realLastDim) {
+          auto ri = idxs(shape, flat);
+          bool rowInLogical = true;
+          for (uint64_t d = 0; d + 1 < ri.size(); d++) {
+            if (ri[d] >= logical_shape[d]) {
+              rowInLogical = false;
+              break;
+            }
+          }
+
+          int64_t start = rowInLogical ? logicalLastDim : 0;
+          for (int64_t i = start; i < realLastDim; i++) {
+            assert(data[flat + i] == 0.0f && "padding is not zero");
+          }
+        }
+      }
+
+      void spanIter(std::vector<int64_t> shape, std::function<void(int64_t idx, int64_t sz)> action) const {
+        uint idx = 0;
+        auto a = utils::area(shape);
+
+        while (idx < a) {
+          auto rowIdx = idxs(shape, idx);
+          rowIdx.pop_back();
+          auto fidx = idx_dot(rowIdx);
+          action(fidx, this->shape.back());
+          idx += shape.back();
+        }
+      }
     };
 
     struct Buffer {
@@ -151,7 +192,7 @@ namespace nn {
 
       static data_t value(std::initializer_list<float> list);
 
-      static data_t random(std::initializer_list<int64_t> dims);
+      static data_t random(std::initializer_list<int64_t> dims, float stddev = 1.0f);
       template<typename dims_t>
       static data_t copy(dims_t dims, const float* data);
       static data_t copy(std::initializer_list<int64_t> dims, const float* data);
@@ -195,6 +236,10 @@ namespace nn {
       void rowsIter(std::function<void(int64_t)> f) const {
         xs.dspan.rowsIter(dims, f);
       }
+
+      void spanIter(std::function<void(int64_t, int64_t)> f) const {
+        xs.dspan.spanIter(dims, f);
+      }
     };
 
     enum class device_type {
@@ -207,53 +252,97 @@ namespace nn {
     void mul(const data_t A, const data_t B, data_t C, device_type dev=device_type::cpu);
     void div(const data_t A, const data_t B, data_t C, device_type dev=device_type::cpu);
     void sigmoid(const data_t A, data_t C, device_type=device_type::cpu);
+    void sigmoidDerivative(const data_t A, data_t C, device_type=device_type::cpu);
 
-    void sum(const data_t A, data_t C, device_type dev=device_type::cpu);
+    void sum(const data_t A, data_t C, int64_t dim=-1, device_type dev=device_type::cpu);
   }
 
   namespace layer {
     struct linear {
       tensor::data_t weights;
       tensor::data_t biases;
-      tensor::data_t output;
+      tensor::data_t zs;
+      tensor::data_t as;
+
+      std::optional<tensor::data_t> dweights;
+      std::optional<tensor::data_t> dbiases;
+      std::optional<tensor::data_t> input;
+      std::optional<tensor::data_t> error;
 
       linear(int64_t inputsCount, int64_t outputsCount)
-        : weights(tensor::data_t::random({outputsCount, inputsCount}))
-        , biases(tensor::data_t::random({outputsCount}))
-        , output(tensor::data_t::zero({outputsCount}))
+        : weights(tensor::data_t::random({outputsCount, inputsCount}, std::sqrt(2.0f / (inputsCount + outputsCount))))
+        , biases(tensor::data_t::zero({outputsCount}))
+        , zs(tensor::data_t::zero({outputsCount}))
+        , as(tensor::data_t::zero({outputsCount}))
         {}
 
       linear(tensor::data_t weights, tensor::data_t biases)
         : weights(weights)
           , biases(biases)
-          , output(tensor::data_t::zero({biases.size()}))
+          , zs(tensor::data_t::zero({biases.size()}))
+          , as(tensor::data_t::zero({biases.size()}))
           {
             assert(weights.dims.size() == 2);
             assert(biases.dims.size() == 1);
             assert(weights.dims[0] == biases.dims[0]);
           }
       
-      tensor::data_t& forward(const tensor::data_t& input)
+      tensor::data_t forward(const tensor::data_t& input)
       {
-        if (input.dims.size() != output.dims.size()) {
+        if (input.dims != zs.dims) {
           std::vector<int64_t> dims;
           dims.push_back(biases.size());
           if (input.dims.size() == 2) {
             dims.push_back(input.dims.back());
           }
-          output = tensor::data_t::zero(dims);
+          zs = tensor::data_t::zero(dims);
+          as = tensor::data_t::zero(dims);
         }
-        matmul(weights, input, output, tensor::device_type::gpu);
-        add(output, biases, output);
-        sigmoid(output, output);
+        this->input = input;
+        matmul(weights, input, zs, tensor::device_type::cpu);
+        add(zs, biases, zs);
+        sigmoid(zs, as);
+        return as;
+      }
+
+      tensor::data_t backward(const tensor::data_t input)
+      {
+        tensor::data_t sd = tensor::data_t::zero(zs.dims);
+        nn::tensor::sigmoidDerivative(zs, sd);
+
+        error = tensor::data_t::zero(input.dims);
+
+        nn::tensor::mul(input, sd, error.value());
+
+        tensor::data_t tweights = weights.copy();
+        tweights.transpose();
+        tensor::data_t output = tensor::data_t::zero({tweights.dims[0], error->dims[1]});
+        nn::tensor::matmul(tweights, *error, output, nn::tensor::device_type::cpu);
+
+        dweights = tensor::data_t::zero({weights.dims[1], weights.dims[0]});
+        dbiases = tensor::data_t::zero({biases.dims[0]});
+        error->transpose();
+
+        tensor::matmul(*(this->input), *error, *dweights, nn::tensor::device_type::cpu);
+        dweights->transpose();
+        tensor::sum(*error, *dbiases, 0);
+        tensor::div(*dbiases, nn::tensor::data_t::value({2.0f * input.dims[1]}), *dbiases);
+        tensor::div(*dweights, nn::tensor::data_t::value({2.0f * input.dims[1]}), *dweights);
+
         return output;
+      }
+
+      void applyGrad() 
+      {
+        tensor::add(weights, *dweights, weights, 1.0, -1.0);
+        tensor::add(biases, *dbiases, biases, 1.0, -1.0);
       }
 
     };
   }
 
   namespace helpers {
-    tensor::data_t& forward(std::vector<nn::layer::linear>& model, const tensor::data_t& input);
+    tensor::data_t forward(std::vector<nn::layer::linear>& model, const tensor::data_t& input);
 
     template<typename dims_t>
       std::vector<nn::layer::linear> buildModel(dims_t dims);
@@ -263,8 +352,101 @@ namespace nn {
     tensor::data_t quadratic(
         std::vector<nn::layer::linear>& model, 
         tensor::data_t& inputs, 
-        const tensor::data_t& outputs
+        const tensor::data_t& outputs,
+        tensor::data_t* backwardInput
         );
+  }
+
+  namespace train {
+    struct data_loader {
+      data_loader(std::string path, int64_t batchSize, bool shuffle)
+      : path(path)
+      , batchSize(batchSize)
+      , shuffle(shuffle)
+      {
+        load();
+      }
+
+      std::optional<std::pair<tensor::data_t, tensor::data_t>> nextBatch()
+      {
+        std::vector<float> output_vectors;
+        std::vector<int64_t> output_vectors_dims = {0, 10};
+        std::vector<nn::tensor::data_t> input_images;
+
+        if (idx >= entries.size()) return std::nullopt;
+
+        int64_t count = batchSize < 0 ? entries.size() : batchSize;
+        for (auto i = 0; i < count; i++) {
+          auto image = grayscale_image(entries.at(idx + i).second);
+          std::vector<float> imageOutput(10);
+          imageOutput[entries.at(idx + i).first] = 1.0;
+
+          input_images.push_back(image);
+          output_vectors.insert(output_vectors.end(), imageOutput.begin(), imageOutput.end());
+          output_vectors_dims.at(0) += 1;
+        }
+        idx += count;
+
+        auto output = std::make_pair(nn::tensor::data_t::concat(input_images), nn::tensor::data_t::copy(output_vectors_dims, output_vectors.data()));
+        output.first.transpose();
+        return output;
+      }
+
+      void load()
+      {
+        idx = 0;
+        namespace fs = std::filesystem;
+        std::vector<fs::path> dirs;
+        for (const auto& entry : fs::directory_iterator(path)) {
+          if (fs::is_directory(entry.path())) {
+            dirs.push_back(entry.path());
+          }
+        }
+        std::sort(dirs.begin(), dirs.end());
+
+        for (const auto& dirPath : dirs) {
+          auto dirName = dirPath.filename().string();
+          int64_t dirNameNumber = std::atoi(dirName.data());
+
+          for (const auto& imageEntry : fs::directory_iterator(dirPath)) {
+            entries.push_back(std::make_pair(dirNameNumber, imageEntry.path()));
+          }
+        }
+
+        if (shuffle) {
+          std::shuffle(entries.begin(), entries.end(), gen);
+        }
+      }
+
+      void reset() {
+        idx = 0;
+        if (shuffle) {
+          std::shuffle(entries.begin(), entries.end(), gen);
+        }
+      }
+
+      nn::tensor::data_t grayscale_image(std::string path)
+      {
+        int width, height, channels;
+        auto data = stbi_loadf(path.data(), &width, &height, &channels, 0);
+
+        auto output = nn::tensor::data_t::copy({height, width}, data);
+
+        stbi_image_free(data);
+        return output;
+      }
+
+
+      private:
+      std::vector<std::pair<int64_t, std::string>> entries;
+      std::string path;
+      uint64_t idx = 0;
+      int64_t batchSize;
+      bool shuffle;
+      std::mt19937 gen{};
+    };
+
+    void train(tensor::data_t trainingData, size_t epochs_count, size_t mini_batch_size, float learning_rate, std::optional<tensor::data_t> testData);
   }
 
   namespace cpu {
@@ -340,17 +522,23 @@ namespace nn {
 
       void cpu_dispatch(std::function<void()> block)
       {
-        // printf("cpu_dispatch w8=%llu curr=%llu sig=%llu\n", last_id, event.signaledValue, last_id + 1);
-        [event notifyListener:listener atValue:last_id block:^(id<MTLSharedEvent> _Nonnull _event, uint64_t _value) {
+        assert(!dispatch_queue_get_label(DISPATCH_CURRENT_QUEUE_LABEL) ||
+               strcmp(dispatch_queue_get_label(DISPATCH_CURRENT_QUEUE_LABEL),
+                      dispatch_queue_get_label(cpu::queue)) != 0
+               && "cpu_dispatch called from within a cpu worker callback — this causes non-monotonic event signaling");
+        // [event notifyListener:listener atValue:last_id block:^(id<MTLSharedEvent> _Nonnull _event, uint64_t _value) {
           block();
-          event.signaledValue = _value + 1;
-        }];
-        last_id += 1;
+          // event.signaledValue = _value + 1;
+        // }];
+        // last_id += 1;
       }
 
       void gpu_dispatch(std::function<void()> block)
       {
-        // printf("gpu_dispatch w8=%llu curr=%llu sig=%llu\n", last_id, event.signaledValue, last_id + 1);
+        assert(!dispatch_queue_get_label(DISPATCH_CURRENT_QUEUE_LABEL) ||
+               strcmp(dispatch_queue_get_label(DISPATCH_CURRENT_QUEUE_LABEL),
+                      dispatch_queue_get_label(cpu::queue)) != 0
+               && "gpu_dispatch called from within a cpu worker callback — this causes non-monotonic event signaling");
         [cmd encodeWaitForEvent:event value:last_id];
         block();
         [cmd encodeSignalEvent:event value:last_id + 1];
@@ -446,7 +634,10 @@ namespace nn::tensor {
   void cpu_sigmoid(const data_t A, data_t C);
   void gpu_sigmoid(const data_t A, data_t C);
 
-  void cpu_sum(const data_t A, data_t C);
+  void cpu_sigmoidDerivative(const data_t A, data_t C);
+  void gpu_sigmoidDerivative(const data_t A, data_t C);
+
+  void cpu_sum(const data_t A, data_t C, int64_t dim);
   void gpu_sum(const data_t A, data_t C);
 
   void copy(allocator::Buffer dst, float* src, const std::vector<int64_t>& shape) {
@@ -528,13 +719,13 @@ namespace nn::tensor {
     return out;
   }
 
-  data_t data_t::random(std::initializer_list<int64_t> dims) {
+  data_t data_t::random(std::initializer_list<int64_t> dims, float stddev) {
     auto storage = allocator::aligned_alloc(dims);
 
     // Zero the entire buffer first (including padding)
     memset(storage.data, 0, utils::area(storage.dspan.shape) * sizeof(float));
 
-    std::normal_distribution<float> dstr(0.0, 1.0);
+    std::normal_distribution<float> dstr(0.0, stddev);
 
     // Generate random data only for logical shape
     auto area = utils::area(dims);
@@ -649,33 +840,67 @@ namespace nn::tensor {
     }
   }
 
+  void sigmoidDerivative(const data_t A, data_t C, device_type dev)
+  {
+    data_t tmpc = data_t::zero(C.dims);
+    sigmoid(A, C, dev);
+    sub(data_t::value({1.0}), C, tmpc, dev);
+    mul(C, tmpc, C, dev);
+  }
+
   void sub(const data_t A, const data_t B, data_t C, device_type dev)
   {
     nn::tensor::add(A, B, C, 1.0, -1.0, dev);
   }
 
-  void sum(const data_t A, data_t C, device_type dev)
+  void sum(const data_t A, data_t C, int64_t dim, device_type dev)
   {
     if (dev == device_type::cpu) {
       nn::stream::global.cpu_dispatch([=] {
-          cpu_sum(A, C);
+          cpu_sum(A, C, dim);
           });
     }
     else if (dev == device_type::gpu) {
+      assert(A.dims.size() == 1);
       nn::stream::global.gpu_dispatch([=] {
-          gpu_sum(A, C);
+        nn::gpu::sum(stream::global.cmd, A.xs.mtl, 1.0, C.xs.mtl);
           });
     }
   }
 
-  void cpu_sum(const data_t A, data_t C)
+  void cpu_sum(const data_t A, data_t C, int64_t dim)
   {
-    assert(C.dims.size() == 1);
-    assert(C.dims[0] == 1);
 
-    A.rowsIter([&](auto i) {
-      *C.data() += A.data()[i];
-    });
+    if (dim == -1) {
+      assert(C.dims.size() == 1);
+      assert(C.dims[0] == 1);
+
+      float acc = 0;
+      A.spanIter([&](auto i, auto sz) {
+        simd_packed_float16* simdA = (simd_packed_float16*)(A.data() + i);
+        for (auto j = 0; j < (sz / 16); j++) {
+          acc += simd_dot(simdA[j], 1.0);
+        }
+      });
+    *C.data() = acc;
+    } else {
+      assert(A.dims.size() == 2);
+      assert(C.dims.size() == 1);
+      
+      if (dim == 0) {
+        assert(C.dims[0] == A.dims[1]);
+        A.rowsIter([&](auto i) {
+            C.data()[i % C.xs.dspan.shape[dim]] += A.data()[i];
+        });
+      } else if (dim == 1) {
+        assert(C.dims[0] == A.dims[0]);
+        A.rowsIter([&](auto i) {
+            C.data()[i / C.xs.dspan.shape[dim]] += A.data()[i];
+        });
+      } else {
+        assert(false);
+      }
+    }
   }
 
   void gpu_sum(const data_t A, data_t C)
@@ -711,7 +936,7 @@ namespace nn::tensor {
       assert(B.dims.size() == C.dims.size());
       assert(A.dims[0] == 1);
       C.rowsIter([&](int64_t i) {
-        C.data()[i] = B.data()[i] * b + *A.data() * a;
+        C.data()[i] = *A.data() * a + B.data()[i] * b;
       });
     } else {
       assert(false);
@@ -818,16 +1043,16 @@ namespace nn::tensor {
     if (B.dims.size() == 1 && B.size() == 1) {
       assert(A.size() == C.size());
       assert(A.dims.size() == C.dims.size());
-      for (uint i = 0; i < A.size(); i++) {
+      C.rowsIter([&](auto i) {
         C.data()[i] = A.data()[i] / B.data()[0];
-      }
+      });
     } else if (A.dims.size() == B.dims.size()) {
       assert(A.dims.size() == C.dims.size());
       assert(A.size() == C.size());
       assert(A.size() == B.size());
-      for (uint i = 0; i < A.size(); i++) {
+      C.rowsIter([&](auto i) {
         C.data()[i] = A.data()[i] / B.data()[i];
-      }
+      });
     } else {
       assert(false);
     }
@@ -883,23 +1108,26 @@ data_t data_t::copy() const {
   auto storage = allocator::aligned_alloc(dims);
   data_t out{dims, storage};
   auto srcBuffer = xs;
-  nn::stream::global.gpu_dispatch([=]() {
-    id<MTLBlitCommandEncoder> blit = [nn::stream::global.cmd blitCommandEncoder];
-    [blit copyFromBuffer:srcBuffer.mtl sourceOffset:0 toBuffer:storage.mtl destinationOffset:0 size:[storage.mtl length]];
-    [blit endEncoding];
+  nn::stream::global.cpu_dispatch([=]() {
+    memcpy(storage.mtl.contents, srcBuffer.mtl.contents, storage.mtl.length);
   });
+  // nn::stream::global.gpu_dispatch([=]() {
+  //   id<MTLBlitCommandEncoder> blit = [nn::stream::global.cmd blitCommandEncoder];
+  //   [blit copyFromBuffer:srcBuffer.mtl sourceOffset:0 toBuffer:storage.mtl destinationOffset:0 size:[storage.mtl length]];
+  //   [blit endEncoding];
+  // });
   return out;
 }
 }
 
 namespace nn::helpers {
-  tensor::data_t& forward(std::vector<nn::layer::linear>& model, tensor::data_t& input)
+  tensor::data_t forward(std::vector<nn::layer::linear>& model, tensor::data_t& input)
   {
-    auto output = &input;
+    auto output = input;
     for (auto& l : model) {
-      output = &l.forward(*output);
+      output = l.forward(output);
     }
-    return *output; 
+    return output.copy(); 
   }
 
   template<typename dims_t>
@@ -909,6 +1137,15 @@ namespace nn::helpers {
       std::vector<nn::layer::linear> model;
       for (uint i = 0; i < dims.size() - 1; i++) {
         model.emplace_back(dims.at(i), dims.at(i + 1));
+      }
+      return model;
+    }
+
+    std::vector<nn::layer::linear> buildModel(std::initializer_list<int64_t> dims)
+    {
+      std::vector<nn::layer::linear> model;
+      for (uint i = 0; i < dims.size() - 1; i++) {
+        model.emplace_back(dims.begin()[i], dims.begin()[i + 1]);
       }
       return model;
     }
@@ -940,18 +1177,22 @@ namespace nn::cost {
   tensor::data_t quadratic(
     std::vector<nn::layer::linear>& model, 
     tensor::data_t& inputs, 
-    const tensor::data_t& outputs
+    const tensor::data_t& outputs,
+    tensor::data_t* backwardInput
   )
   {
-    auto modelOutput = nn::helpers::forward(model, inputs);
+    auto modelOutput = nn::helpers::forward(model, inputs).copy();
     modelOutput.transpose();
 
     auto diff = nn::tensor::data_t::zero(modelOutput.dims);
     auto cost = nn::tensor::data_t::value({0.0});
 
     nn::tensor::sub(modelOutput, outputs, diff);
-    nn::tensor::mul(diff, diff, diff);
-    nn::tensor::sum(diff, cost);
+    if (backwardInput) *backwardInput = diff.copy();
+    nn::tensor::mul(diff, diff, diff, nn::tensor::device_type::cpu);
+    nn::stream::global.synchronize();
+
+    nn::tensor::sum(diff, cost, -1, nn::tensor::device_type::cpu);
     nn::tensor::div(cost, nn::tensor::data_t::value({(float)2 * outputs.dims[0]}), cost);
 
     return cost;
@@ -1100,6 +1341,7 @@ namespace nn::cpu {
 
   void dot(const float* x, const float* y, float* output, int64_t N)
   {
+    assert(N % 16 == 0);
     *output = 0;
     for (int64_t i = 0; i < N; i++) {
       *output += x[i] * y[i];
@@ -1250,7 +1492,6 @@ namespace nn::gpu {
 
   void sum(id<MTLCommandBuffer> cmd, id<MTLBuffer> X, float y, id<MTLBuffer> output)
   {
-    assert(X.length == output.length);
     const uint64_t N = X.length / sizeof(float);
 
     static id<MTLComputePipelineState> kernel0;
