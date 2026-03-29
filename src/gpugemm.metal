@@ -229,3 +229,160 @@ kernel void sum_reduce0(
     if (lid == 0) output[group_id] = shared[0];
 }
 
+
+kernel void sigmoid(
+                    const device float* X,
+                    device float* output,
+                    constant const uint& N,
+                    uint gid [[thread_position_in_grid]],
+                    uint threads [[threads_per_grid]]
+                    )
+{
+    for (uint i = gid; i < N; i += threads) {
+        output[i] = 1.0 / (1.0 + exp(-X[i]));
+    }
+}
+
+kernel void sigmoidDerivative(
+                    const device float* X,
+                    device float* output,
+                    constant const uint& N,
+                    uint gid [[thread_position_in_grid]],
+                    uint threads [[threads_per_grid]]
+                    )
+{
+    for (uint i = gid; i < N; i += threads) {
+        float s = 1.0 / (1.0 + exp(-X[i]));
+        output[i] = s * (1.0 - s);
+    }
+}
+kernel void axpby2(
+                  const device float* X, const device float* Y, device float* out,
+                  constant const uint& N,
+                  constant const float& fX,
+                  constant const float& fY,
+                  constant const float& A,
+                  uint gid [[thread_position_in_grid]],
+                  uint threads [[threads_per_grid]]
+                  )
+{
+    for (uint i = gid; i < N; i += threads) {
+        out[i] = X[i] * fX + Y[i] * fY + A;
+    }
+}
+
+kernel void axpby1(
+                  const device float* X, device float* out,
+                  constant const uint& N,
+                  constant const float& fX,
+                  constant const float& A,
+                  uint gid [[thread_position_in_grid]],
+                  uint threads [[threads_per_grid]]
+                  )
+{
+    for (uint i = gid; i < N; i += threads) {
+        out[i] = X[i] * fX + A;
+    }
+}
+
+kernel void addcmul(
+                  const device float* X, const device float* Y, device float* out,
+                  constant const uint& N,
+                  constant const float& a,
+                  constant const float& b,
+                  uint gid [[thread_position_in_grid]],
+                  uint threads [[threads_per_grid]]
+                  )
+{
+    for (uint i = gid; i < N; i += threads) {
+        out[i] = X[i] * Y[i] * a + b;
+    }
+}
+
+kernel void addcdiv(
+                  const device float* X, const device float* Y, device float* out,
+                  constant const uint& N,
+                  constant const float& a,
+                  constant const float& b,
+                  uint gid [[thread_position_in_grid]],
+                  uint threads [[threads_per_grid]]
+                  )
+{
+    for (uint i = gid; i < N; i += threads) {
+        out[i] = X[i] / Y[i] * a + b;
+    }
+}
+
+kernel void axpy(
+                  const device float* X, const device float* Y, device float* out,
+                  constant const uint& N,
+                  constant const float& a,
+                  uint gid [[thread_position_in_grid]],
+                  uint threads [[threads_per_grid]]
+                  )
+{
+    for (uint i = gid; i < N; i += threads) {
+        out[i] = X[i] * a + Y[i];
+    }
+}
+
+kernel void axpby2dBcol(
+                  const device float* X, const device float* Y, device float* out,
+                  constant const uint& N,
+                  constant const float& fX,
+                  constant const float& fY,
+                  constant const float& A,
+                  constant const uint& strideB,
+                  uint gid [[thread_position_in_grid]],
+                  uint threads [[threads_per_grid]]
+                  )
+{
+    for (uint i = gid; i < N; i += threads) {
+        out[i] = X[i] * fX + Y[i / strideB] * fY + A;
+    }
+}
+
+kernel void sum_dim0(
+                  const device float* X,
+                  device float* out,
+                  constant const uint& Nrows,
+                  constant const uint& Ncols,
+                  constant const uint& stride,
+                  uint gid [[thread_position_in_grid]]
+                  )
+{
+    if (gid >= Ncols) return;
+    float acc = 0;
+    for (uint i = 0; i < Nrows; i++) acc += X[i * stride + gid];
+    out[gid] = acc;
+}
+
+kernel void sum_dim1(
+                  const device float* X,
+                  device float* out,
+                  constant const uint& Nrows,
+                  constant const uint& Ncols,
+                  constant const uint& stride,
+                  uint gid [[thread_position_in_grid]]
+                  )
+{
+    if (gid >= Nrows) return;
+    float acc = 0;
+    for (uint j = 0; j < Ncols; j++) acc += X[gid * stride + j];
+    out[gid] = acc;
+}
+
+kernel void transpose(
+                  const device float* X,
+                  device float* out,
+                  constant const uint& M,
+                  constant const uint& N,
+                  uint gid [[thread_position_in_grid]]
+                  )
+{
+    uint y = gid / N;
+    uint x = gid % N;
+    if (y >= M) return;
+    out[x * M + y] = X[y * N + x];
+}
+

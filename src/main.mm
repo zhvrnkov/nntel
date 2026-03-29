@@ -169,12 +169,13 @@ int main_inference()
   auto cost = nn::cost::quadratic(layers, samples.first, samples.second, nullptr);
   nn::stream::global.synchronize();
   std::cout << "cost = " << *cost.data() << std::endl;
+  return 0;
 }
 
 int main()
 {
-  auto train_loader = nn::train::data_loader{"./assets/mnist_png/training", 30, true};
-  auto test_loader = nn::train::data_loader{"./assets/mnist_png/testing", -1, false};
+  auto train_loader = nn::train::data_loader{"/Users/vz/Developer/learn/informatics/ml/nntel/assets/mnist_png/training", 10, true};
+  auto test_loader = nn::train::data_loader{"/Users/vz/Developer/learn/informatics/ml/nntel/assets/mnist_png/testing", -1, false};
 
   auto model = nn::helpers::buildModel({784, 128, 10});
 
@@ -184,11 +185,11 @@ int main()
   nn::stream::global.synchronize();
   std::cout << "initial cost = " << *cost.data() << std::endl;
 
-  for (int64_t epoch = 0; epoch < 256; epoch++) {
+  for (int64_t epoch = 0; epoch < 30; epoch++) @autoreleasepool {
     train_loader.reset();
     std::optional<std::pair<nn::tensor::data_t, nn::tensor::data_t>> batch;
     auto bi = nn::tensor::data_t::zero({1});
-    while ((batch = train_loader.nextBatch())) {
+    while ((batch = train_loader.nextBatch())) @autoreleasepool {
       // std::println("{} {}", nn::utils::xs2str(batch->first.dims), nn::utils::xs2str(batch->second.dims));
       auto cost = nn::cost::quadratic(model, batch->first, batch->second, &bi);
       bi.transpose();
@@ -198,7 +199,7 @@ int main()
       for (int64_t i = model.size() - 1; i >= 0; i--) {
         model[i].applyGrad();
       }
-      // nn::stream::global.synchronize();
+      nn::stream::global.synchronize();
       // std::cout << "cost = " << *cost.data() << std::endl;
     }
     auto cost = nn::cost::quadratic(model, testdata->first, testdata->second, nullptr);

@@ -1,0 +1,23 @@
+[
+  {
+    "arguments": [
+      "/usr/bin/clang++",
+      "-c",
+      "-std=c++23",
+      "-O3",
+      "-ffast-math",
+      "-Wall",
+      "-Wextra",
+      "-framework",
+      "Metal",
+      "-framework",
+      "Foundation",
+      "-o",
+      "main",
+      "src/main.mm"
+    ],
+    "directory": "/Users/vz/Developer/learn/informatics/ml/nntel",
+    "file": "/Users/vz/Developer/learn/informatics/ml/nntel/src/main.mm",
+    "output": "/Users/vz/Developer/learn/informatics/ml/nntel/main"
+  }
+]

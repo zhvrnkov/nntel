@@ -351,7 +351,7 @@ void test_sum_basic() {
     auto A = nn::tensor::data_t::copy({5}, (float[]){1.0f, 2.0f, 3.0f, 4.0f, 5.0f});
     auto C = nn::tensor::data_t::zero({1});
 
-    nn::tensor::sum(A, C, nn::tensor::device_type::cpu);
+    nn::tensor::sum(A, C, -1, nn::tensor::device_type::cpu);
     nn::stream::global.synchronize();
 
     float expected[] = {15.0f}; // 1+2+3+4+5
@@ -366,7 +366,7 @@ void test_sum_2d() {
     });
     auto C = nn::tensor::data_t::zero({1});
 
-    nn::tensor::sum(A, C, nn::tensor::device_type::cpu);
+    nn::tensor::sum(A, C, -1, nn::tensor::device_type::cpu);
     nn::stream::global.synchronize();
 
     float expected[] = {21.0f}; // 1+2+3+4+5+6
@@ -378,7 +378,7 @@ void test_sum_negative() {
     auto A = nn::tensor::data_t::copy({4}, (float[]){-1.0f, 2.0f, -3.0f, 4.0f});
     auto C = nn::tensor::data_t::zero({1});
 
-    nn::tensor::sum(A, C, nn::tensor::device_type::cpu);
+    nn::tensor::sum(A, C, -1, nn::tensor::device_type::cpu);
     nn::stream::global.synchronize();
 
     float expected[] = {2.0f}; // -1+2-3+4
@@ -599,6 +599,98 @@ void test_concat_then_flatten() {
     assert_tensor_equal(batch, expected, 6, "concat_then_flatten_data");
 }
 
+void test_div_scalar() {
+    auto A = nn::tensor::data_t::copy({4}, (float[]){2.0f, 4.0f, 6.0f, 8.0f});
+    auto B = nn::tensor::data_t::copy({1}, (float[]){2.0f});
+    auto C = nn::tensor::data_t::zero({4});
+
+    nn::tensor::div(A, B, C, nn::tensor::device_type::cpu);
+    nn::stream::global.synchronize();
+
+    float expected[] = {1.0f, 2.0f, 3.0f, 4.0f};
+    assert_tensor_equal(C, expected, 4, "div_scalar");
+}
+
+void test_div_scalar_2d() {
+    auto A = nn::tensor::data_t::copy({2, 3}, (float[]){2.0f, 4.0f, 6.0f, 8.0f, 10.0f, 12.0f});
+    auto B = nn::tensor::data_t::copy({1}, (float[]){2.0f});
+    auto C = nn::tensor::data_t::zero({2, 3});
+
+    nn::tensor::div(A, B, C, nn::tensor::device_type::cpu);
+    nn::stream::global.synchronize();
+
+    float expected[] = {1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 6.0f};
+    assert_tensor_equal(C, expected, 6, "div_scalar_2d");
+}
+
+void test_div_elementwise() {
+    auto A = nn::tensor::data_t::copy({4}, (float[]){10.0f, 20.0f, 30.0f, 40.0f});
+    auto B = nn::tensor::data_t::copy({4}, (float[]){2.0f, 4.0f, 5.0f, 8.0f});
+    auto C = nn::tensor::data_t::zero({4});
+
+    nn::tensor::div(A, B, C, nn::tensor::device_type::cpu);
+    nn::stream::global.synchronize();
+
+    float expected[] = {5.0f, 5.0f, 6.0f, 5.0f};
+    assert_tensor_equal(C, expected, 4, "div_elementwise");
+}
+
+void test_div_elementwise_2d() {
+    auto A = nn::tensor::data_t::copy({2, 3}, (float[]){1.0f, 4.0f, 9.0f, 16.0f, 25.0f, 36.0f});
+    auto B = nn::tensor::data_t::copy({2, 3}, (float[]){1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 6.0f});
+    auto C = nn::tensor::data_t::zero({2, 3});
+
+    nn::tensor::div(A, B, C, nn::tensor::device_type::cpu);
+    nn::stream::global.synchronize();
+
+    float expected[] = {1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 6.0f};
+    assert_tensor_equal(C, expected, 6, "div_elementwise_2d");
+}
+
+void test_div_elementwise_padding_safety() {
+    // Shape {3} has padding to 64: B's padded region is zero, so addcdiv produces 0/0=NaN there.
+    // Logical results must be correct — rowsIter only reads logical indices.
+    auto A = nn::tensor::data_t::copy({3}, (float[]){6.0f, 9.0f, 12.0f});
+    auto B = nn::tensor::data_t::copy({3}, (float[]){2.0f, 3.0f, 4.0f});
+    auto C = nn::tensor::data_t::zero({3});
+
+    nn::tensor::div(A, B, C, nn::tensor::device_type::cpu);
+    nn::stream::global.synchronize();
+
+    float expected[] = {3.0f, 3.0f, 3.0f};
+    assert_tensor_equal(C, expected, 3, "div_elementwise_padding_safety");
+}
+
+void test_sum_dim0() {
+    auto A = nn::tensor::data_t::copy({3, 4}, (float[]){
+        1.0f, 2.0f, 3.0f, 4.0f,
+        5.0f, 6.0f, 7.0f, 8.0f,
+        9.0f, 10.0f, 11.0f, 12.0f
+    });
+    auto C = nn::tensor::data_t::zero({4});
+
+    nn::tensor::sum(A, C, 0, nn::tensor::device_type::cpu);
+    nn::stream::global.synchronize();
+
+    float expected[] = {15.0f, 18.0f, 21.0f, 24.0f};
+    assert_tensor_equal(C, expected, 4, "sum_dim0");
+}
+
+void test_sum_dim1() {
+    auto A = nn::tensor::data_t::copy({3, 4}, (float[]){
+        1.0f, 2.0f, 3.0f, 4.0f,
+        5.0f, 6.0f, 7.0f, 8.0f,
+        9.0f, 10.0f, 11.0f, 12.0f
+    });
+    auto C = nn::tensor::data_t::zero({3});
+
+    nn::tensor::sum(A, C, 1, nn::tensor::device_type::cpu);
+    nn::stream::global.synchronize();
+
+    float expected[] = {10.0f, 26.0f, 42.0f};
+    assert_tensor_equal(C, expected, 3, "sum_dim1");
+}
+
 void run_all_tests() {
     std::cout << "Running CPU tensor operations tests..." << std::endl;
     std::cout << "======================================" << std::endl;
@@ -632,10 +724,19 @@ void run_all_tests() {
     test_sigmoid_2d();
     test_sigmoid_extreme_values();
 
+    // Division tests
+    test_div_scalar();
+    test_div_scalar_2d();
+    test_div_elementwise();
+    test_div_elementwise_2d();
+    test_div_elementwise_padding_safety();
+
     // Sum tests
     test_sum_basic();
     test_sum_2d();
     test_sum_negative();
+    test_sum_dim0();
+    test_sum_dim1();
 
     // Constructor tests
     test_data_constructors();
