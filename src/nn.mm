@@ -117,17 +117,21 @@ struct ctx_t {
   : cmd([gpu::queue commandBuffer])
   , event([gpu::device newSharedEvent])
   , listener([[MTLSharedEventListener alloc] initWithDispatchQueue:cpu::queue])
-  , last_id(0) {}
+  , last_id(0)
+  , lastCommandCpu(std::nullopt)
+  {}
 
   id<MTLCommandBuffer> cmd;
   id<MTLSharedEvent> event;
   MTLSharedEventListener* listener;
   uint64_t last_id = 0;
+  std::optional<bool> lastCommandCpu;
+  uint64_t gpu_pending_commands_count = 0;
   
-  void gpuFlush();
-  void synchronize();
-  void cpu_dispatch(std::function<void()> block);
-  void gpu_dispatch(std::function<void()> block);
+  inline void gpuFlush();
+  inline void synchronize();
+  inline void cpu_dispatch(std::function<void()> block);
+  inline void gpu_dispatch(std::function<void()> block);
 };
 
 ctx_t global = ctx_t();
@@ -241,17 +245,16 @@ Buffer aligned_alloc(shape_t shape);
 void free(Buffer buff);
 
 struct Buffer {
-  id<MTLBuffer> mtl;
   float* data;
   ndspan dspan;
   
   Buffer(id<MTLBuffer> mtl, std::vector<int64_t> shape)
-  : mtl(mtl)
-  , data((float*)[mtl contents])
+  : data((float*)[mtl contents])
   , dspan(ndspan{data, shape})
+  , mtl(mtl)
   {
   }
-  
+
   float& operator[](std::vector<int64_t> idxs) {
     return dspan[idxs];
   }
@@ -259,10 +262,19 @@ struct Buffer {
   std::span<float> row(std::vector<int64_t> idxs) {
     return dspan.row(idxs);
   }
+
+  id<MTLBuffer> buff() const {
+    return mtl;
+  }
+  
+  uint64_t size() const {
+    return mtl.length;
+  }
+  private:
+  id<MTLBuffer> mtl;
   
 };
-constexpr uint64_t alignment = 64;
-
+constexpr uint64_t alignment = 1;
 }
 
 
@@ -291,6 +303,10 @@ struct data_t {
   data_t(std::initializer_list<int64_t> dims)
   : dims(dims)
   , xs(allocator::aligned_alloc(dims)) {}
+
+  ~data_t() {
+    allocator::free(xs);
+  }
   
   static data_t value(std::initializer_list<float> list);
   
@@ -307,6 +323,10 @@ struct data_t {
   
   template<typename tensors>
   static data_t concat(tensors xs);
+
+  id<MTLBuffer> buff() const {
+    return xs.buff();
+  }
   
   float* data() const {
     return xs.data;
@@ -389,7 +409,7 @@ struct linear {
     assert(weights.dims[0] == biases.dims[0]);
   }
   
-  tensor::data_t forward(const tensor::data_t& input)
+  tensor::data_t forward(const tensor::data_t& input, tensor::device_type dev)
   {
     std::vector<int64_t> dims;
     dims.push_back(biases.size());
@@ -401,51 +421,51 @@ struct linear {
       as = tensor::data_t::zero(dims);
     }
     this->input = input;
-    matmul(weights, input, zs, tensor::device_type::gpu);
-    add(zs, biases, zs, 1.0, 1.0, tensor::device_type::gpu);
-    sigmoid(zs, as, tensor::device_type::gpu);
-    nn::stream::global.gpuFlush();
+    matmul(weights, input, zs, dev);
+    add(zs, biases, zs, 1.0, 1.0, dev);
+    sigmoid(zs, as, dev);
+    // nn::stream::global.gpuFlush();
     return as;
   }
   
-  tensor::data_t backward(const tensor::data_t input)
+  tensor::data_t backward(const tensor::data_t input, tensor::device_type dev)
   {
     tensor::data_t sd = tensor::data_t::zero(zs.dims);
-    nn::tensor::sigmoidDerivative(zs, sd, tensor::device_type::gpu);
+    nn::tensor::sigmoidDerivative(zs, sd, dev);
     
     error = tensor::data_t::zero(input.dims);
     
-    nn::tensor::mul(input, sd, error.value(), tensor::device_type::gpu);
+    nn::tensor::mul(input, sd, error.value(), dev);
     
-    tensor::transpose(weights, tweights, tensor::device_type::gpu);
+    tensor::transpose(weights, tweights, dev);
     tensor::data_t output = tensor::data_t::zero({tweights.dims[0], error->dims[1]});
-    nn::tensor::matmul(tweights, *error, output, nn::tensor::device_type::gpu);
+    nn::tensor::matmul(tweights, *error, output, dev);
     
     dweights = tensor::data_t::zero({weights.dims[1], weights.dims[0]});
     dbiases = tensor::data_t::zero({biases.dims[0]});
-    error->transpose(tensor::device_type::gpu);
+    error->transpose(dev);
     
-    tensor::matmul(*(this->input), *error, *dweights, nn::tensor::device_type::gpu);
-    dweights->transpose(tensor::device_type::gpu);
-    tensor::sum(*error, *dbiases, 0, tensor::device_type::gpu);
-    tensor::div(*dbiases, nn::tensor::data_t::value({2.0f * input.dims[1]}), *dbiases, tensor::device_type::gpu);
-    tensor::div(*dweights, nn::tensor::data_t::value({2.0f * input.dims[1]}), *dweights, tensor::device_type::gpu);
-    nn::stream::global.gpuFlush();
+    tensor::matmul(*(this->input), *error, *dweights, dev);
+    dweights->transpose(dev);
+    tensor::sum(*error, *dbiases, 0, dev);
+    tensor::div(*dbiases, nn::tensor::data_t::value({2.0f * input.dims[1]}), *dbiases, dev);
+    tensor::div(*dweights, nn::tensor::data_t::value({2.0f * input.dims[1]}), *dweights, dev);
+    // nn::stream::global.gpuFlush();
     
     return output;
   }
   
-  void applyGrad()
+  void applyGrad(tensor::device_type dev)
   {
-    tensor::add(weights, *dweights, weights, 1.0, -0.5, tensor::device_type::gpu);
-    tensor::add(biases, *dbiases, biases, 1.0, -0.5, tensor::device_type::gpu);
+    tensor::add(weights, *dweights, weights, 1.0, -0.5, dev);
+    tensor::add(biases, *dbiases, biases, 1.0, -0.5, dev);
   }
   
 };
 }
 
 namespace helpers {
-tensor::data_t forward(std::vector<nn::layer::linear>& model, const tensor::data_t& input);
+tensor::data_t forward(std::vector<nn::layer::linear>& model, const tensor::data_t& input, tensor::device_type);
 
 template<typename dims_t>
 std::vector<nn::layer::linear> buildModel(dims_t dims);
@@ -456,7 +476,8 @@ tensor::data_t quadratic(
                          std::vector<nn::layer::linear>& model,
                          tensor::data_t& inputs,
                          const tensor::data_t& outputs,
-                         tensor::data_t* backwardInput
+                         tensor::data_t* backwardInput,
+                         tensor::device_type dev
                          );
 }
 
@@ -480,12 +501,8 @@ struct data_loader {
     
     int64_t count = batchSize < 0 ? entries.size() : batchSize;
     for (auto i = 0; i < count; i++) {
-      auto image = grayscale_image(entries.at(idx + i).second);
-      std::vector<float> imageOutput(10);
-      imageOutput[entries.at(idx + i).first] = 1.0;
-      
-      input_images.push_back(image);
-      output_vectors.insert(output_vectors.end(), imageOutput.begin(), imageOutput.end());
+      input_images.push_back(entries.at(idx + i).second);
+      output_vectors.insert(output_vectors.end(), entries.at(idx + i).first.begin(), entries.at(idx + i).first.end());
       output_vectors_dims.at(0) += 1;
     }
     idx += count;
@@ -512,7 +529,9 @@ struct data_loader {
       int64_t dirNameNumber = std::atoi(dirName.data());
       
       for (const auto& imageEntry : fs::directory_iterator(dirPath)) {
-        entries.push_back(std::make_pair(dirNameNumber, imageEntry.path()));
+        std::vector<float> imageOutput(10);
+        imageOutput[dirNameNumber] = 1.0;
+        entries.push_back(std::make_pair(imageOutput, grayscale_image(imageEntry.path())));
       }
     }
     
@@ -541,7 +560,7 @@ struct data_loader {
   
   
 private:
-  std::vector<std::pair<int64_t, std::string>> entries;
+  std::vector<std::pair<std::vector<float>, nn::tensor::data_t>> entries;
   std::string path;
   uint64_t idx = 0;
   int64_t batchSize;
@@ -763,7 +782,7 @@ void matmul(const data_t A, const data_t B, data_t C, device_type dev)
       });
     } else if (dev == device_type::gpu) {
       nn::stream::global.gpu_dispatch([=] {
-        nn::gpu::gemm(stream::global.cmd, A.xs.mtl, B.xs.mtl, C.xs.mtl, C.rshape()[0], A.rshape()[1], C.rshape()[1]);
+        nn::gpu::gemm(stream::global.cmd, A.buff(), B.buff(), C.buff(), C.rshape()[0], A.rshape()[1], C.rshape()[1]);
       });
     }
   } else if (A.dims.size() == 1 && B.dims.size() == 1) {
@@ -776,7 +795,7 @@ void matmul(const data_t A, const data_t B, data_t C, device_type dev)
       });
     } else if (dev == device_type::gpu) {
       nn::stream::global.gpu_dispatch([=] {
-        nn::gpu::dot(stream::global.cmd, A.xs.mtl, B.xs.mtl, C.xs.mtl);
+        nn::gpu::dot(stream::global.cmd, A.buff(), B.buff(), C.buff());
       });
     }
   } else if (A.dims.size() == 2 && B.dims.size() == 1) {
@@ -789,7 +808,7 @@ void matmul(const data_t A, const data_t B, data_t C, device_type dev)
       });
     } else if (dev == device_type::gpu) {
       nn::stream::global.gpu_dispatch([=] {
-        nn::gpu::gemv(stream::global.cmd, A.xs.mtl, B.xs.mtl, C.xs.mtl, A.rshape()[0], A.rshape()[1]);
+        nn::gpu::gemv(stream::global.cmd, A.buff(), B.buff(), C.buff(), A.rshape()[0], A.rshape()[1]);
       });
     }
   } else {
@@ -807,7 +826,7 @@ void add(const data_t A, const data_t B, data_t C, float a, float b, device_type
       });
     } else if (dev == device_type::gpu) {
       nn::stream::global.gpu_dispatch([=] {
-        nn::gpu::axpby(stream::global.cmd, A.xs.mtl, B.xs.mtl, C.xs.mtl, a, b, 0.0);
+        nn::gpu::axpby(stream::global.cmd, A.buff(), B.buff(), C.buff(), a, b, 0.0);
       });
     }
   } else if (B.dims.size() == 1) {
@@ -819,7 +838,7 @@ void add(const data_t A, const data_t B, data_t C, float a, float b, device_type
         });
       } else if (dev == device_type::gpu) {
         nn::stream::global.gpu_dispatch([=] {
-          nn::gpu::axpby(stream::global.cmd, A.xs.mtl, A.xs.mtl, C.xs.mtl, a, 0.0, *B.data() * b);
+          nn::gpu::axpby(stream::global.cmd, A.buff(), A.buff(), C.buff(), a, 0.0, *B.data() * b);
         });
       }
     } else {
@@ -831,7 +850,7 @@ void add(const data_t A, const data_t B, data_t C, float a, float b, device_type
         });
       } else if (dev == device_type::gpu) {
         nn::stream::global.gpu_dispatch([=] {
-          nn::gpu::axpby2dBcol(stream::global.cmd, A.xs.mtl, B.xs.mtl, C.xs.mtl, a, b, 0.0f);
+          nn::gpu::axpby2dBcol(stream::global.cmd, A.buff(), B.buff(), C.buff(), a, b, 0.0f);
         });
       }
     }
@@ -844,7 +863,7 @@ void add(const data_t A, const data_t B, data_t C, float a, float b, device_type
       });
     } else if (dev == device_type::gpu) {
       nn::stream::global.gpu_dispatch([=] {
-        nn::gpu::axpby(stream::global.cmd, B.xs.mtl, B.xs.mtl, C.xs.mtl, 0.0, b, *A.data() * a);
+        nn::gpu::axpby(stream::global.cmd, B.buff(), B.buff(), C.buff(), 0.0, b, *A.data() * a);
       });
     }
   } else {
@@ -868,7 +887,7 @@ void mul(const data_t A, const data_t B, data_t C, device_type dev)
       });
     } else if (dev == device_type::gpu) {
       nn::stream::global.gpu_dispatch([=] {
-        nn::gpu::axpby(stream::global.cmd, A.xs.mtl, A.xs.mtl, C.xs.mtl, B.data()[0], 0.0, 0.0);
+        nn::gpu::axpby(stream::global.cmd, A.buff(), A.buff(), C.buff(), B.data()[0], 0.0, 0.0);
       });
     }
   } else if (A.dims.size() == B.dims.size()) {
@@ -881,7 +900,7 @@ void mul(const data_t A, const data_t B, data_t C, device_type dev)
       });
     } else if (dev == device_type::gpu) {
       nn::stream::global.gpu_dispatch([=] {
-        nn::gpu::addcmul(stream::global.cmd, A.xs.mtl, B.xs.mtl, C.xs.mtl, 1.0, 0.0);
+        nn::gpu::addcmul(stream::global.cmd, A.buff(), B.buff(), C.buff(), 1.0, 0.0);
       });
     }
   } else {
@@ -900,7 +919,7 @@ void div(const data_t A, const data_t B, data_t C, device_type dev)
       });
     } else if (dev == device_type::gpu) {
       nn::stream::global.gpu_dispatch([=] {
-        nn::gpu::axpby(stream::global.cmd, A.xs.mtl, A.xs.mtl, C.xs.mtl, 1.0f / B.data()[0], 0.0, 0.0);
+        nn::gpu::axpby(stream::global.cmd, A.buff(), A.buff(), C.buff(), 1.0f / B.data()[0], 0.0, 0.0);
       });
     }
   } else if (A.dims.size() == B.dims.size()) {
@@ -913,7 +932,7 @@ void div(const data_t A, const data_t B, data_t C, device_type dev)
       });
     } else if (dev == device_type::gpu) {
       nn::stream::global.gpu_dispatch([=] {
-        nn::gpu::addcdiv(stream::global.cmd, A.xs.mtl, B.xs.mtl, C.xs.mtl, 1.0, 0.0);
+        nn::gpu::addcdiv(stream::global.cmd, A.buff(), B.buff(), C.buff(), 1.0, 0.0);
       });
     }
   } else {
@@ -930,7 +949,7 @@ void sigmoid(const data_t A, data_t C, device_type dev)
     });
   } else if (dev == device_type::gpu) {
     nn::stream::global.gpu_dispatch([=] {
-      nn::gpu::sigmoid(nn::stream::global.cmd, A.xs.mtl, C.xs.mtl);
+      nn::gpu::sigmoid(nn::stream::global.cmd, A.buff(), C.buff());
     });
   }
 }
@@ -944,7 +963,7 @@ void sigmoidDerivative(const data_t A, data_t C, device_type dev)
     });
   } else if (dev == device_type::gpu) {
     nn::stream::global.gpu_dispatch([=] {
-      nn::gpu::sigmoidDerivative(nn::stream::global.cmd, A.xs.mtl, C.xs.mtl);
+      nn::gpu::sigmoidDerivative(nn::stream::global.cmd, A.buff(), C.buff());
     });
   }
 }
@@ -957,17 +976,34 @@ void sum(const data_t A, data_t C, int64_t dim, device_type dev)
     if (dev == device_type::cpu) {
       nn::stream::global.cpu_dispatch([=] {
         float acc = 0;
+        // TODO: make this ifs static
         A.spanIter([&](auto i, auto sz) {
-          simd_packed_float16* simdA = (simd_packed_float16*)(A.data() + i);
-          for (auto j = 0; j < (sz / 16); j++) {
-            acc += simd_dot(simdA[j], 1.0);
+          if (sz % 16 == 0) {
+            simd_packed_float16* simdA = (simd_packed_float16*)(A.data() + i);
+            for (auto j = 0; j < (sz / 16); j++) {
+              acc += simd_dot(simdA[j], 1.0);
+            }
+          } else if (sz % 8 == 0) {
+            simd_packed_float8* simdA = (simd_packed_float8*)(A.data() + i);
+            for (auto j = 0; j < (sz / 8); j++) {
+              acc += simd_dot(simdA[j], 1.0);
+            }
+          } else if (sz % 4 == 0) {
+            simd_packed_float4* simdA = (simd_packed_float4*)(A.data() + i);
+            for (auto j = 0; j < (sz / 4); j++) {
+              acc += simd_dot(simdA[j], 1.0);
+            }
+          } else {
+            for (auto j = 0; j < sz; j++) {
+              acc += A.data()[i + j];
+            }
           }
         });
         *C.data() = acc;
       });
     } else if (dev == device_type::gpu) {
       nn::stream::global.gpu_dispatch([=] {
-        nn::gpu::sum(stream::global.cmd, A.xs.mtl, 1.0, C.xs.mtl);
+        nn::gpu::sum(stream::global.cmd, A.buff(), 1.0, C.buff());
       });
     }
   } else {
@@ -983,7 +1019,7 @@ void sum(const data_t A, data_t C, int64_t dim, device_type dev)
         });
       } else if (dev == device_type::gpu) {
         nn::stream::global.gpu_dispatch([=] {
-          nn::gpu::sum_dim0(stream::global.cmd, A.xs.mtl, C.xs.mtl,
+          nn::gpu::sum_dim0(stream::global.cmd, A.buff(), C.buff(),
                             (uint32_t)A.dims[0], (uint32_t)A.dims[1],
                             (uint32_t)A.rshape()[1]);
         });
@@ -998,7 +1034,7 @@ void sum(const data_t A, data_t C, int64_t dim, device_type dev)
         });
       } else if (dev == device_type::gpu) {
         nn::stream::global.gpu_dispatch([=] {
-          nn::gpu::sum_dim1(stream::global.cmd, A.xs.mtl, C.xs.mtl,
+          nn::gpu::sum_dim1(stream::global.cmd, A.buff(), C.buff(),
                             (uint32_t)A.dims[0], (uint32_t)A.dims[1],
                             (uint32_t)A.rshape()[1]);
         });
@@ -1022,7 +1058,7 @@ void transpose(const data_t A, data_t C, device_type dev)
     });
   } else if (dev == device_type::gpu) {
     nn::stream::global.gpu_dispatch([=]() {
-      nn::gpu::transpose(stream::global.cmd, A.xs.mtl, C.xs.mtl,
+      nn::gpu::transpose(stream::global.cmd, A.buff(), C.buff(),
                          (uint32_t)rshape[0], (uint32_t)rshape[1]);
     });
   }
@@ -1063,12 +1099,12 @@ data_t data_t::copy(tensor::device_type dev) const {
   auto srcBuffer = xs;
   if (dev == tensor::device_type::cpu) {
     nn::stream::global.cpu_dispatch([=]() {
-      memcpy(storage.mtl.contents, srcBuffer.mtl.contents, storage.mtl.length);
+      memcpy(storage.data, srcBuffer.data, storage.size());
     });
   } else {
     nn::stream::global.gpu_dispatch([=]() {
       id<MTLBlitCommandEncoder> blit = [nn::stream::global.cmd blitCommandEncoder];
-      [blit copyFromBuffer:srcBuffer.mtl sourceOffset:0 toBuffer:storage.mtl destinationOffset:0 size:[storage.mtl length]];
+      [blit copyFromBuffer:srcBuffer.buff() sourceOffset:0 toBuffer:storage.buff() destinationOffset:0 size:storage.size()];
       [blit endEncoding];
     });
   }
@@ -1077,13 +1113,13 @@ data_t data_t::copy(tensor::device_type dev) const {
 }
 
 namespace nn::helpers {
-tensor::data_t forward(std::vector<nn::layer::linear>& model, tensor::data_t& input)
+tensor::data_t forward(std::vector<nn::layer::linear>& model, tensor::data_t& input, tensor::device_type dev)
 {
   auto output = input;
   for (auto& l : model) {
-    output = l.forward(output);
+    output = l.forward(output, dev);
   }
-  return output.copy(nn::tensor::device_type::gpu);
+  return output.copy(dev);
 }
 
 template<typename dims_t>
@@ -1117,15 +1153,15 @@ Buffer aligned_alloc(shape_t shape)
     s = alignment * ((s + (alignment - 1)) / alignment);
   }
   
-  auto length = utils::area(realShape) * sizeof(float);
-  auto mtlBuff = [gpu::device newBufferWithLength:length options:MTLResourceStorageModeShared];
-  memset(mtlBuff.contents, 0, length);
+  auto area = utils::area(realShape);
+  auto mtlBuff = [gpu::device newBufferWithLength:area * sizeof(float) options:MTLResourceStorageModeShared];
+  memset(mtlBuff.contents, 0, area * sizeof(float));
   return Buffer { mtlBuff, realShape };
 }
 
 void free(Buffer buff)
 {
-  // no-op
+  // delete[] buff.data;
 }
 }
 
@@ -1134,23 +1170,24 @@ tensor::data_t quadratic(
                          std::vector<nn::layer::linear>& model,
                          tensor::data_t& inputs,
                          const tensor::data_t& outputs,
-                         tensor::data_t* backwardInput
+                         tensor::data_t* backwardInput,
+                         tensor::device_type dev
                          )
 {
-  auto modelOutput = nn::helpers::forward(model, inputs).copy(tensor::device_type::gpu);
-  modelOutput.transpose(tensor::device_type::gpu);
+  auto modelOutput = nn::helpers::forward(model, inputs, dev).copy(dev);
+  modelOutput.transpose(dev);
   
   auto diff = nn::tensor::data_t::zero(modelOutput.dims);
   auto cost = nn::tensor::data_t::value({0.0});
   
-  nn::tensor::sub(modelOutput, outputs, diff, tensor::device_type::gpu);
-  if (backwardInput) *backwardInput = diff.copy(tensor::device_type::gpu);
-  nn::tensor::mul(diff, diff, diff, nn::tensor::device_type::gpu);
+  nn::tensor::sub(modelOutput, outputs, diff, dev);
+  if (backwardInput) *backwardInput = diff.copy(dev);
+  nn::tensor::mul(diff, diff, diff, dev);
   nn::stream::global.synchronize();
   
-  nn::tensor::sum(diff, cost, -1, nn::tensor::device_type::gpu);
-  nn::tensor::div(cost, nn::tensor::data_t::value({(float)2 * outputs.dims[0]}), cost, nn::tensor::device_type::gpu);
-  nn::stream::global.gpuFlush();
+  nn::tensor::sum(diff, cost, -1, dev);
+  nn::tensor::div(cost, nn::tensor::data_t::value({(float)2 * outputs.dims[0]}), cost, dev);
+  // nn::stream::global.gpuFlush();
   
   return cost;
 }
@@ -1159,13 +1196,14 @@ tensor::data_t quadratic(
 namespace nn::stream {
 
 
-void ctx_t::gpuFlush()
+inline void ctx_t::gpuFlush()
 {
+  gpu_pending_commands_count = 0;
   [cmd commit];
   cmd = [gpu::queue commandBuffer];
 }
 
-void ctx_t::synchronize()
+inline void ctx_t::synchronize()
 {
   gpuFlush();
   [event waitUntilSignaledValue:last_id timeoutMS:-1];
@@ -1176,29 +1214,44 @@ void ctx_t::synchronize()
   last_id = 0;
 }
 
-void ctx_t::cpu_dispatch(std::function<void()> block)
+inline void ctx_t::cpu_dispatch(std::function<void()> block)
 {
   assert(!dispatch_queue_get_label(DISPATCH_CURRENT_QUEUE_LABEL) ||
          strcmp(dispatch_queue_get_label(DISPATCH_CURRENT_QUEUE_LABEL),
                 dispatch_queue_get_label(cpu::queue)) != 0
          && "cpu_dispatch called from within a cpu worker callback — this causes non-monotonic event signaling");
-  [event notifyListener:listener atValue:last_id block:^(id<MTLSharedEvent> _Nonnull _event, uint64_t _value) {
+  auto val = last_id;
+  if (lastCommandCpu.has_value() && *lastCommandCpu == false) {
+    gpuFlush();
+    dispatch_async(cpu::queue, ^() {
+      [event waitUntilSignaledValue:val timeoutMS:-1];
+    });
+  }
+  lastCommandCpu = true;
+  dispatch_async(cpu::queue, ^() {
     block();
-    event.signaledValue = _value + 1;
-  }];
+    event.signaledValue = val + 1;
+  });
   last_id += 1;
 }
 
-void ctx_t::gpu_dispatch(std::function<void()> block)
+inline void ctx_t::gpu_dispatch(std::function<void()> block)
 {
   assert(!dispatch_queue_get_label(DISPATCH_CURRENT_QUEUE_LABEL) ||
          strcmp(dispatch_queue_get_label(DISPATCH_CURRENT_QUEUE_LABEL),
                 dispatch_queue_get_label(cpu::queue)) != 0
          && "gpu_dispatch called from within a cpu worker callback — this causes non-monotonic event signaling");
-  [cmd encodeWaitForEvent:event value:last_id];
+  if (lastCommandCpu.has_value() && *lastCommandCpu == true) {
+    [cmd encodeWaitForEvent:event value:last_id];
+  }
+  gpu_pending_commands_count += 1;
+  lastCommandCpu = false;
   block();
   [cmd encodeSignalEvent:event value:last_id + 1];
   last_id += 1;
+  if (gpu_pending_commands_count >= 20) {
+    gpuFlush();
+  }
 }
 }
 
@@ -1358,20 +1411,72 @@ void axpby(const float* x, const float* y, float* output, int64_t N, float fX, f
 
 void sigmoid(const float* x, float* output, int64_t N)
 {
-  simd_packed_float4* simdX = (simd_packed_float4*)x;
-  simd_packed_float4* simdOut = (simd_packed_float4*)output;
-  for (int64_t i = 0; i < (N / 4); i++) {
-    simdOut[i] = 1.0 / (1.0 + _simd_exp_f4(-simdX[i]));
+  if (N % 16 == 0) {
+    simd_packed_float16* simdX = (simd_packed_float16*)x;
+    simd_packed_float16* simdOut = (simd_packed_float16*)output;
+    for (int64_t i = 0; i < (N / 16); i++) {
+      simdOut[i] = 1.0 / (1.0 + simd::exp(-simdX[i]));
+    }
+  } else if (N % 8 == 0) {
+    simd_packed_float8* simdX = (simd_packed_float8*)x;
+    simd_packed_float8* simdOut = (simd_packed_float8*)output;
+    for (int64_t i = 0; i < (N / 8); i++) {
+      simdOut[i] = 1.0 / (1.0 + simd::exp(-simdX[i]));
+    }
+  } else if (N % 4 == 0) {
+    simd_packed_float4* simdX = (simd_packed_float4*)x;
+    simd_packed_float4* simdOut = (simd_packed_float4*)output;
+    for (int64_t i = 0; i < (N / 4); i++) {
+      simdOut[i] = 1.0 / (1.0 + simd::exp(-simdX[i]));
+    }
+  } else if (N % 2 == 0) {
+    simd_packed_float2* simdX = (simd_packed_float2*)x;
+    simd_packed_float2* simdOut = (simd_packed_float2*)output;
+    for (int64_t i = 0; i < (N / 2); i++) {
+      simdOut[i] = 1.0 / (1.0 + simd::exp(-simdX[i]));
+    }
+  } else {
+    for (int64_t i = 0; i < N; i++) {
+      output[i] = 1.0 / (1.0 + exp(-x[i]));
+    }
   }
 }
 
 void sigmoidDerivative(const float* x, float* output, int64_t N)
 {
-  simd_packed_float4* simdX = (simd_packed_float4*)x;
-  simd_packed_float4* simdOut = (simd_packed_float4*)output;
-  for (int64_t i = 0; i < (N / 4); i++) {
-    simd_packed_float4 s = 1.0 / (1.0 + _simd_exp_f4(-simdX[i]));
-    simdOut[i] = s * (1.0 - s);
+  if (N % 16 == 0) {
+    simd_packed_float16* simdX = (simd_packed_float16*)x;
+    simd_packed_float16* simdOut = (simd_packed_float16*)output;
+    for (int64_t i = 0; i < (N / 16); i++) {
+      simd_packed_float16 s = 1.0 / (1.0 + simd::exp(-simdX[i]));
+      simdOut[i] = s * (1.0 - s);
+    }
+  } else if (N % 8 == 0) {
+    simd_packed_float8* simdX = (simd_packed_float8*)x;
+    simd_packed_float8* simdOut = (simd_packed_float8*)output;
+    for (int64_t i = 0; i < (N / 8); i++) {
+      simd_packed_float8 s = 1.0 / (1.0 + simd::exp(-simdX[i]));
+      simdOut[i] = s * (1.0 - s);
+    }
+  } else if (N % 4 == 0) {
+    simd_packed_float4* simdX = (simd_packed_float4*)x;
+    simd_packed_float4* simdOut = (simd_packed_float4*)output;
+    for (int64_t i = 0; i < (N / 4); i++) {
+      simd_packed_float4 s = 1.0 / (1.0 + simd::exp(-simdX[i]));
+      simdOut[i] = s * (1.0 - s);
+    }
+  } else if (N % 2 == 0) {
+    simd_packed_float2* simdX = (simd_packed_float2*)x;
+    simd_packed_float2* simdOut = (simd_packed_float2*)output;
+    for (int64_t i = 0; i < (N / 2); i++) {
+      simd_packed_float2 s = 1.0 / (1.0 + simd::exp(-simdX[i]));
+      simdOut[i] = s * (1.0 - s);
+    }
+  } else {
+    for (int64_t i = 0; i < N; i++) {
+      float s = 1.0 / (1.0 + exp(-x[i]));
+      output[i] = s * (1.0 - s);
+    }
   }
 }
 
@@ -1409,9 +1514,24 @@ void axpby2dBcol(const float* x, const float* y, float* output, int64_t N, int64
 namespace nn::gpu {
 void gemm(id<MTLCommandBuffer> cmd, id<MTLBuffer> A, id<MTLBuffer> B, id<MTLBuffer> C, uint64_t m, uint64_t n, uint64_t p)
 {
-  constexpr auto dim = 4;
-  constexpr auto block_size = dim * 8;
-  constexpr auto block_size_m = dim * 8 * 2;
+  static id<MTLComputePipelineState> kernel_dim2;
+  static id<MTLComputePipelineState> kernel_dim4;
+  static dispatch_once_t onceToken;
+  dispatch_once(&onceToken, ^{
+    auto kernelFuncDim2 = [lib newFunctionWithName:@"sgemm_32x32_unrolled_dim2"];
+    auto kernelFuncDim4 = [lib newFunctionWithName:@"sgemm_32x32_unrolled_dim4"];
+    kernel_dim2 = [device newComputePipelineStateWithFunction:kernelFuncDim2 error:nil];
+    kernel_dim4 = [device newComputePipelineStateWithFunction:kernelFuncDim4 error:nil];
+  });
+  if (!kernel_dim2 || !kernel_dim4) {
+    NSLog(@"got error during pipeline creation");
+    return;
+  }
+
+  auto kernel = kernel_dim2;
+  uint64_t dim = 2;
+  uint64_t block_size = dim * 8;
+  uint64_t block_size_m = dim * 8 * 2;
   
   assert(m >= block_size_m && "M must be at least 64");
   assert(n >= 8 && "N must be at least 8");
@@ -1420,15 +1540,11 @@ void gemm(id<MTLCommandBuffer> cmd, id<MTLBuffer> A, id<MTLBuffer> B, id<MTLBuff
   assert(n % 8 == 0 && "N must be divisible by 8");
   assert(p % block_size == 0 && "P must be divisible by 32");
   
-  static id<MTLComputePipelineState> kernel;
-  static dispatch_once_t onceToken;
-  dispatch_once(&onceToken, ^{
-    auto kernelFunc = [lib newFunctionWithName:@"sgemm_32x32_unrolled"];
-    kernel = [device newComputePipelineStateWithFunction:kernelFunc error:nil];
-  });
-  if (!kernel) {
-    NSLog(@"got error during pipeline creation");
-    return;
+  if (m >= (block_size_m * 2) && p >= (block_size * 2) && m % (block_size_m * 2) == 0 && p % (block_size * 2) == 0) {
+    kernel = kernel_dim4;
+    dim = 4;
+    block_size = dim * 8;
+    block_size_m = dim * 8 * 2;
   }
   
   MTLSize tgroupSize;
@@ -1444,7 +1560,8 @@ void gemm(id<MTLCommandBuffer> cmd, id<MTLBuffer> A, id<MTLBuffer> B, id<MTLBuff
   [encoder setBytes:(void*)&n length:sizeof(n) atIndex:4];
   [encoder setBytes:(void*)&p length:sizeof(p) atIndex:5];
   [encoder setComputePipelineState:kernel];
-  [encoder dispatchThreadgroups:MTLSizeMake(p / block_size, m / block_size_m, 1) threadsPerThreadgroup:tgroupSize];
+  [encoder dispatchThreadgroups:MTLSizeMake(p / block_size, m / block_size_m, 1) 
+          threadsPerThreadgroup:tgroupSize];
   
   [encoder endEncoding];
 }

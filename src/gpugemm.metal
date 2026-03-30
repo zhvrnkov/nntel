@@ -1,118 +1,184 @@
 #include <metal_stdlib>
 using namespace metal;
 
-kernel void sgemm_32x32_unrolled(
-                        const device float* A,
-                        const device float* B,
-                        device float* C,
-                        constant const uint64_t& M,
-                        constant const uint64_t& N,
-                        constant const uint64_t& P,
-                        //                  threadgroup float* As,
-                        //                  threadgroup float* Bs,
-                        uint2 gid [[thread_position_in_grid]],
-                        uint2 lid [[thread_position_in_threadgroup]],
-                        uint2 group_id [[threadgroup_position_in_grid]],
-                        uint2 group_size [[threads_per_threadgroup]]
-                        )
+kernel void sgemm_32x32_unrolled_dim4(
+                                 const device float* A,
+                                 const device float* B,
+                                 device float* C,
+                                 constant const uint64_t& M,
+                                 constant const uint64_t& N,
+                                 constant const uint64_t& P,
+                                 //                  threadgroup float* As,
+                                 //                  threadgroup float* Bs,
+                                 uint2 gid [[thread_position_in_grid]],
+                                 uint2 lid [[thread_position_in_threadgroup]],
+                                 uint2 group_id [[threadgroup_position_in_grid]],
+                                 uint2 group_size [[threads_per_threadgroup]]
+                                 )
 {
     constexpr auto dim = 4;
     constexpr auto dK = dim * 8;
     // threadgroup float As[dK * dK];
     // threadgroup float Bs[dK * dK];
-
+    
     // C += lid.y * 16 * N;
     A += group_id.y * (dK * 2) * N;
     B += group_id.x * dK;
     C += group_id.y * (dK * 2) * P + group_id.x * dK;
-
+    
     A += lid.y * dK * N;
     C += lid.y * dK * P;
-
+    
     simdgroup_float8x8 Am[dim];
     simdgroup_float8x8 Bm[dim];
     simdgroup_float8x8 acc[dim][dim];
-
+    
     // --- Unrolled initialization of acc matrix ---
     acc[0][0] = simdgroup_float8x8(0);
     acc[0][1] = simdgroup_float8x8(0);
     acc[0][2] = simdgroup_float8x8(0);
     acc[0][3] = simdgroup_float8x8(0);
-
+    
     acc[1][0] = simdgroup_float8x8(0);
     acc[1][1] = simdgroup_float8x8(0);
     acc[1][2] = simdgroup_float8x8(0);
     acc[1][3] = simdgroup_float8x8(0);
-
+    
     acc[2][0] = simdgroup_float8x8(0);
     acc[2][1] = simdgroup_float8x8(0);
     acc[2][2] = simdgroup_float8x8(0);
     acc[2][3] = simdgroup_float8x8(0);
-
+    
     acc[3][0] = simdgroup_float8x8(0);
     acc[3][1] = simdgroup_float8x8(0);
     acc[3][2] = simdgroup_float8x8(0);
     acc[3][3] = simdgroup_float8x8(0);
-
+    
     for (uint k = 0; k < N; k += 8) {
         // --- Unrolled loads from A into Am[0..3] ---
         simdgroup_load(Am[0], A + (k) + (0 * 8 * N), N);
         simdgroup_load(Am[1], A + (k) + (1 * 8 * N), N);
         simdgroup_load(Am[2], A + (k) + (2 * 8 * N), N);
         simdgroup_load(Am[3], A + (k) + (3 * 8 * N), N);
-
+        
         // --- Unrolled loads from B into Bm[0..3] ---
         simdgroup_load(Bm[0], B + (k * P) + (0 * 8), P);
         simdgroup_load(Bm[1], B + (k * P) + (1 * 8), P);
         simdgroup_load(Bm[2], B + (k * P) + (2 * 8), P);
         simdgroup_load(Bm[3], B + (k * P) + (3 * 8), P);
-
+        
         // --- Unrolled multiply-accumulate for all 4x4 combinations ---
         // y = 0
         simdgroup_multiply_accumulate(acc[0][0], Am[0], Bm[0], acc[0][0]);
         simdgroup_multiply_accumulate(acc[0][1], Am[0], Bm[1], acc[0][1]);
         simdgroup_multiply_accumulate(acc[0][2], Am[0], Bm[2], acc[0][2]);
         simdgroup_multiply_accumulate(acc[0][3], Am[0], Bm[3], acc[0][3]);
-
+        
         // y = 1
         simdgroup_multiply_accumulate(acc[1][0], Am[1], Bm[0], acc[1][0]);
         simdgroup_multiply_accumulate(acc[1][1], Am[1], Bm[1], acc[1][1]);
         simdgroup_multiply_accumulate(acc[1][2], Am[1], Bm[2], acc[1][2]);
         simdgroup_multiply_accumulate(acc[1][3], Am[1], Bm[3], acc[1][3]);
-
+        
         // y = 2
         simdgroup_multiply_accumulate(acc[2][0], Am[2], Bm[0], acc[2][0]);
         simdgroup_multiply_accumulate(acc[2][1], Am[2], Bm[1], acc[2][1]);
         simdgroup_multiply_accumulate(acc[2][2], Am[2], Bm[2], acc[2][2]);
         simdgroup_multiply_accumulate(acc[2][3], Am[2], Bm[3], acc[2][3]);
-
+        
         // y = 3
         simdgroup_multiply_accumulate(acc[3][0], Am[3], Bm[0], acc[3][0]);
         simdgroup_multiply_accumulate(acc[3][1], Am[3], Bm[1], acc[3][1]);
         simdgroup_multiply_accumulate(acc[3][2], Am[3], Bm[2], acc[3][2]);
         simdgroup_multiply_accumulate(acc[3][3], Am[3], Bm[3], acc[3][3]);
     }
-
+    
     // --- Unrolled stores from acc to C ---
     simdgroup_store(acc[0][0], C + (0 * 8 * P) + (0 * 8), P);
     simdgroup_store(acc[0][1], C + (0 * 8 * P) + (1 * 8), P);
     simdgroup_store(acc[0][2], C + (0 * 8 * P) + (2 * 8), P);
     simdgroup_store(acc[0][3], C + (0 * 8 * P) + (3 * 8), P);
-
+    
     simdgroup_store(acc[1][0], C + (1 * 8 * P) + (0 * 8), P);
     simdgroup_store(acc[1][1], C + (1 * 8 * P) + (1 * 8), P);
     simdgroup_store(acc[1][2], C + (1 * 8 * P) + (2 * 8), P);
     simdgroup_store(acc[1][3], C + (1 * 8 * P) + (3 * 8), P);
-
+    
     simdgroup_store(acc[2][0], C + (2 * 8 * P) + (0 * 8), P);
     simdgroup_store(acc[2][1], C + (2 * 8 * P) + (1 * 8), P);
     simdgroup_store(acc[2][2], C + (2 * 8 * P) + (2 * 8), P);
     simdgroup_store(acc[2][3], C + (2 * 8 * P) + (3 * 8), P);
-
+    
     simdgroup_store(acc[3][0], C + (3 * 8 * P) + (0 * 8), P);
     simdgroup_store(acc[3][1], C + (3 * 8 * P) + (1 * 8), P);
     simdgroup_store(acc[3][2], C + (3 * 8 * P) + (2 * 8), P);
     simdgroup_store(acc[3][3], C + (3 * 8 * P) + (3 * 8), P);
+}
+
+kernel void sgemm_32x32_unrolled_dim2(
+                                 const device float* A,
+                                 const device float* B,
+                                 device float* C,
+                                 constant const uint64_t& M,
+                                 constant const uint64_t& N,
+                                 constant const uint64_t& P,
+                                 //                  threadgroup float* As,
+                                 //                  threadgroup float* Bs,
+                                 uint2 gid [[thread_position_in_grid]],
+                                 uint2 lid [[thread_position_in_threadgroup]],
+                                 uint2 group_id [[threadgroup_position_in_grid]],
+                                 uint2 group_size [[threads_per_threadgroup]]
+                                 )
+{
+    constexpr auto dim = 2;
+    constexpr auto dK = dim * 8;
+    // threadgroup float As[dK * dK];
+    // threadgroup float Bs[dK * dK];
+    
+    // C += lid.y * 16 * N;
+    A += group_id.y * (dK * 2) * N;
+    B += group_id.x * dK;
+    C += group_id.y * (dK * 2) * P + group_id.x * dK;
+    
+    A += lid.y * dK * N;
+    C += lid.y * dK * P;
+    
+    simdgroup_float8x8 Am[dim];
+    simdgroup_float8x8 Bm[dim];
+    simdgroup_float8x8 acc[dim][dim];
+    
+    // --- Unrolled initialization of acc matrix ---
+    acc[0][0] = simdgroup_float8x8(0);
+    acc[0][1] = simdgroup_float8x8(0);
+    
+    acc[1][0] = simdgroup_float8x8(0);
+    acc[1][1] = simdgroup_float8x8(0);
+    
+    for (uint k = 0; k < N; k += 8) {
+        // --- Unrolled loads from A into Am[0..3] ---
+        simdgroup_load(Am[0], A + (k) + (0 * 8 * N), N);
+        simdgroup_load(Am[1], A + (k) + (1 * 8 * N), N);
+        
+        // --- Unrolled loads from B into Bm[0..3] ---
+        simdgroup_load(Bm[0], B + (k * P) + (0 * 8), P);
+        simdgroup_load(Bm[1], B + (k * P) + (1 * 8), P);
+        
+        // --- Unrolled multiply-accumulate for all 4x4 combinations ---
+        // y = 0
+        simdgroup_multiply_accumulate(acc[0][0], Am[0], Bm[0], acc[0][0]);
+        simdgroup_multiply_accumulate(acc[0][1], Am[0], Bm[1], acc[0][1]);
+        
+        // y = 1
+        simdgroup_multiply_accumulate(acc[1][0], Am[1], Bm[0], acc[1][0]);
+        simdgroup_multiply_accumulate(acc[1][1], Am[1], Bm[1], acc[1][1]);
+    }
+    
+    // --- Unrolled stores from acc to C ---
+    simdgroup_store(acc[0][0], C + (0 * 8 * P) + (0 * 8), P);
+    simdgroup_store(acc[0][1], C + (0 * 8 * P) + (1 * 8), P);
+    
+    simdgroup_store(acc[1][0], C + (1 * 8 * P) + (0 * 8), P);
+    simdgroup_store(acc[1][1], C + (1 * 8 * P) + (1 * 8), P);
 }
 
 kernel void sgemv(
