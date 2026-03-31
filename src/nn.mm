@@ -1,6 +1,7 @@
 #pragma once
 
 #include <MacTypes.h>
+#include <cstring>
 #include <iostream>
 #include <optional>
 #include <simd/packed.h>
@@ -16,6 +17,8 @@
 #include <cassert>
 #include <print>
 #include <functional>
+#define ACCELERATE_NEW_LAPACK
+#include <Accelerate/Accelerate.h>
 
 #define NN_IMPL
 
@@ -87,6 +90,26 @@ void addcmul(const float* x, const float* y, float* output, int64_t N, float a, 
 void addcdiv(const float* x, const float* y, float* output, int64_t N, float a, float b);
 void sigmoid(const float* x, float* output, int64_t N);
 void sigmoidDerivative(const float* x, float* output, int64_t N);
+void sum(const float* x, float* output, int64_t N);
+void sum_dim0(const float* x, float* output, int64_t Nrows, int64_t Ncols, int64_t stride);
+void sum_dim1(const float* x, float* output, int64_t Nrows, int64_t Ncols, int64_t stride);
+}
+
+namespace accelerate {
+void gemm(const float* A, const float* B, float* C, int64_t M, int64_t N, int64_t P, bool transposeB = false);
+void gemv(const float* mat, const float* vec, float* output, uint64_t M, uint64_t N);
+void dot(const float* x, const float* y, float* output, int64_t N);
+void axpby(const float* x, const float* y, float* output, int64_t N, float fX, float fY, float a);
+void axpby2dBcol(const float* x, const float* y, float* output, int64_t N, int64_t NB, float fX, float fY, float a);
+void axpy(const float* x, const float* y, float* output, int64_t N, float a);
+void addcmul(const float* x, const float* y, float* output, int64_t N, float a, float b);
+void addcdiv(const float* x, const float* y, float* output, int64_t N, float a, float b);
+void sigmoid(const float* x, float* output, int64_t N);
+void sigmoidDerivative(const float* x, float* output, int64_t N);
+void sum(const float* x, float* output, int64_t N);
+void sum_dim0(const float* x, float* output, int64_t Nrows, int64_t Ncols, int64_t stride);
+void sum_dim1(const float* x, float* output, int64_t Nrows, int64_t Ncols, int64_t stride);
+void transpose(const float* m, float* mT, int64_t M, int64_t N);
 }
 
 namespace utils {
@@ -130,7 +153,8 @@ struct ctx_t {
   
   inline void gpuFlush();
   inline void synchronize();
-  inline void cpu_dispatch(std::function<void()> block);
+  template<typename block_t>
+  inline void cpu_dispatch(block_t block);
   inline void gpu_dispatch(std::function<void()> block);
 };
 
@@ -158,6 +182,10 @@ struct ndspan {
   , shape(shape)
   , strides(computeStrides(shape))
   {}
+
+  int64_t size() const {
+    return utils::area(shape) * sizeof(float);
+  }
   
   int64_t idx_dot(const std::vector<int64_t>& idxs) const {
     int64_t idx = 0;
@@ -255,6 +283,13 @@ struct Buffer {
   {
   }
 
+  Buffer(std::shared_ptr<float[]> sptr, std::vector<int64_t> shape)
+  : data(sptr.get())
+  , dspan(ndspan{data, shape})
+  , sptr(sptr)
+  {
+  }
+
   float& operator[](std::vector<int64_t> idxs) {
     return dspan[idxs];
   }
@@ -264,14 +299,16 @@ struct Buffer {
   }
 
   id<MTLBuffer> buff() const {
+    assert(false);
     return mtl;
   }
   
   uint64_t size() const {
-    return mtl.length;
+    return dspan.size();
   }
   private:
   id<MTLBuffer> mtl;
+  std::shared_ptr<float[]> sptr;
   
 };
 constexpr uint64_t alignment = 1;
@@ -281,7 +318,8 @@ constexpr uint64_t alignment = 1;
 namespace tensor {
 enum class device_type {
   cpu,
-  gpu
+  gpu,
+  accelerate
 };
 
 struct data_t {
@@ -322,7 +360,7 @@ struct data_t {
   static data_t fill(std::initializer_list<int64_t> dims, float x);
   
   template<typename tensors>
-  static data_t concat(tensors xs);
+  static data_t concat(const tensors& xs);
 
   id<MTLBuffer> buff() const {
     return xs.buff();
@@ -364,16 +402,16 @@ struct data_t {
   }
 };
 
-void matmul(const data_t A, const data_t B, data_t C, device_type dev=device_type::cpu);
-void add(const data_t A, const data_t B, data_t C, float a=1.0, float b=1.0, device_type dev=device_type::cpu);
-void sub(const data_t A, const data_t B, data_t C, device_type dev=device_type::cpu);
-void mul(const data_t A, const data_t B, data_t C, device_type dev=device_type::cpu);
-void div(const data_t A, const data_t B, data_t C, device_type dev=device_type::cpu);
-void sigmoid(const data_t A, data_t C, device_type=device_type::cpu);
-void sigmoidDerivative(const data_t A, data_t C, device_type=device_type::cpu);
+void matmul(const data_t& A, const data_t& B, data_t& C, device_type dev=device_type::cpu);
+void add(const data_t& A, const data_t& B, data_t& C, float a=1.0, float b=1.0, device_type dev=device_type::cpu);
+void sub(const data_t& A, const data_t& B, data_t& C, device_type dev=device_type::cpu);
+void mul(const data_t& A, const data_t& B, data_t& C, device_type dev=device_type::cpu);
+void div(const data_t& A, const data_t& B, data_t& C, device_type dev=device_type::cpu);
+void sigmoid(const data_t& A, data_t& C, device_type=device_type::cpu);
+void sigmoidDerivative(const data_t& A, data_t& C, device_type=device_type::cpu);
 
-void sum(const data_t A, data_t C, int64_t dim=-1, device_type dev=device_type::cpu);
-void transpose(const data_t A, data_t C, device_type dev=device_type::cpu);
+void sum(const data_t& A, data_t& C, int64_t dim=-1, device_type dev=device_type::cpu);
+void transpose(const data_t& A, data_t& C, device_type dev=device_type::cpu);
 }
 
 namespace layer {
@@ -417,8 +455,8 @@ struct linear {
       dims.push_back(input.dims.back());
     }
     if (dims != zs.dims) {
-      zs = tensor::data_t::zero(dims);
-      as = tensor::data_t::zero(dims);
+      zs = tensor::data_t(dims);
+      as = tensor::data_t(dims);
     }
     this->input = input;
     matmul(weights, input, zs, dev);
@@ -430,42 +468,37 @@ struct linear {
   
   tensor::data_t backward(const tensor::data_t input, tensor::device_type dev)
   {
-    tensor::data_t sd = tensor::data_t::zero(zs.dims);
-    nn::tensor::sigmoidDerivative(zs, sd, dev);
+    nn::tensor::sigmoidDerivative(zs, zs, dev);
     
-    error = tensor::data_t::zero(input.dims);
-    
-    nn::tensor::mul(input, sd, error.value(), dev);
+    error = tensor::data_t{input.dims};
+    nn::tensor::mul(input, zs, error.value(), dev);
     
     tensor::transpose(weights, tweights, dev);
     tensor::data_t output = tensor::data_t::zero({tweights.dims[0], error->dims[1]});
     nn::tensor::matmul(tweights, *error, output, dev);
     
-    dweights = tensor::data_t::zero({weights.dims[1], weights.dims[0]});
+    dweights = tensor::data_t::zero({weights.dims[0], weights.dims[1]});
     dbiases = tensor::data_t::zero({biases.dims[0]});
-    error->transpose(dev);
     
-    tensor::matmul(*(this->input), *error, *dweights, dev);
-    dweights->transpose(dev);
-    tensor::sum(*error, *dbiases, 0, dev);
-    tensor::div(*dbiases, nn::tensor::data_t::value({2.0f * input.dims[1]}), *dbiases, dev);
-    tensor::div(*dweights, nn::tensor::data_t::value({2.0f * input.dims[1]}), *dweights, dev);
-    // nn::stream::global.gpuFlush();
+    (*(this->input)).transpose();
+    
+    tensor::matmul(*error, *(this->input), *dweights, dev);
+    tensor::sum(*error, *dbiases, 1, dev);
     
     return output;
   }
   
   void applyGrad(tensor::device_type dev)
   {
-    tensor::add(weights, *dweights, weights, 1.0, -0.5, dev);
-    tensor::add(biases, *dbiases, biases, 1.0, -0.5, dev);
+    tensor::add(weights, *dweights, weights, 1.0, -1.0 / (2.0 * zs.dims[1]), dev);
+    tensor::add(biases, *dbiases, biases, 1.0, -1.0 / (2.0 * zs.dims[1]), dev);
   }
   
 };
 }
 
 namespace helpers {
-tensor::data_t forward(std::vector<nn::layer::linear>& model, const tensor::data_t& input, tensor::device_type);
+const tensor::data_t forward(std::vector<nn::layer::linear>& model, const tensor::data_t& input, tensor::device_type);
 
 template<typename dims_t>
 std::vector<nn::layer::linear> buildModel(dims_t dims);
@@ -509,6 +542,7 @@ struct data_loader {
     
     auto output = std::make_pair(nn::tensor::data_t::concat(input_images), nn::tensor::data_t::copy(output_vectors_dims, output_vectors.data()));
     output.first.transpose();
+    output.second.transpose();
     return output;
   }
   
@@ -739,7 +773,7 @@ data_t data_t::random(std::initializer_list<int64_t> dims, float stddev) {
 }
 
 template<typename tensors>
-data_t data_t::concat(tensors xs) {
+data_t data_t::concat(const tensors& xs) {
   auto singleSize = xs.begin()->size();
   uint64_t count = 0;
   for (auto& x : xs) {
@@ -753,23 +787,17 @@ data_t data_t::concat(tensors xs) {
   // Zero the entire buffer first (including padding)
   memset(storage.data, 0, utils::area(storage.dspan.shape) * sizeof(float));
   
-  auto area = utils::area(dims);
-  std::vector<float> tmp(area);
   uint64_t i = 0;
   for (auto& x : xs) {
-    int64_t j = 0;
-    x.rowsIter([&](int64_t srcIdx) {
-      tmp[singleSize * i + j++] = x.data()[srcIdx];
-    });
+    memcpy(storage.data + x.rsize() * i, x.data(), x.rsize() * sizeof(float));
     i += 1;
   }
-  nn::tensor::copy(storage, tmp.data(), dims);
   
   data_t out{dims, storage};
   return out;
 }
 
-void matmul(const data_t A, const data_t B, data_t C, device_type dev)
+void matmul(const data_t& A, const data_t& B, data_t& C, device_type dev)
 {
   if (A.dims.size() == 2 && B.dims.size() == 2) {
     assert(C.dims.size() == 2);
@@ -779,6 +807,10 @@ void matmul(const data_t A, const data_t B, data_t C, device_type dev)
     if (dev == device_type::cpu) {
       nn::stream::global.cpu_dispatch([=] {
         nn::cpu::gemm(A.data(), B.data(), C.data(), C.rshape()[0], A.rshape()[1], C.rshape()[1]);
+      });
+    } else if (dev == device_type::accelerate) {
+      nn::stream::global.cpu_dispatch([=] {
+        nn::accelerate::gemm(A.data(), B.data(), C.data(), C.dims[0], A.dims[1], C.dims[1]);
       });
     } else if (dev == device_type::gpu) {
       nn::stream::global.gpu_dispatch([=] {
@@ -793,6 +825,10 @@ void matmul(const data_t A, const data_t B, data_t C, device_type dev)
       nn::stream::global.cpu_dispatch([=] {
         nn::cpu::dot(A.data(), B.data(), C.data(), A.rsize());
       });
+    } else if (dev == device_type::accelerate) {
+      nn::stream::global.cpu_dispatch([=] {
+        nn::accelerate::dot(A.data(), B.data(), C.data(), A.dims[0]);
+      });
     } else if (dev == device_type::gpu) {
       nn::stream::global.gpu_dispatch([=] {
         nn::gpu::dot(stream::global.cmd, A.buff(), B.buff(), C.buff());
@@ -806,6 +842,10 @@ void matmul(const data_t A, const data_t B, data_t C, device_type dev)
       nn::stream::global.cpu_dispatch([=] {
         nn::cpu::gemv(A.data(), B.data(), C.data(), A.rshape()[0], A.rshape()[1]);
       });
+    } else if (dev == device_type::accelerate) {
+      nn::stream::global.cpu_dispatch([=] {
+        nn::accelerate::gemv(A.data(), B.data(), C.data(), A.dims[0], A.dims[1]);
+      });
     } else if (dev == device_type::gpu) {
       nn::stream::global.gpu_dispatch([=] {
         nn::gpu::gemv(stream::global.cmd, A.buff(), B.buff(), C.buff(), A.rshape()[0], A.rshape()[1]);
@@ -816,13 +856,14 @@ void matmul(const data_t A, const data_t B, data_t C, device_type dev)
   }
 }
 
-void add(const data_t A, const data_t B, data_t C, float a, float b, device_type dev)
+void add(const data_t& A, const data_t& B, data_t& C, float a, float b, device_type dev)
 {
   if (A.dims.size() == B.dims.size()) {
     assert(A.dims.size() == C.dims.size());
-    if (dev == device_type::cpu) {
+    if (dev == device_type::cpu || dev == device_type::accelerate) {
+      auto axpbyFn = dev == device_type::accelerate ? nn::accelerate::axpby : nn::cpu::axpby;
       nn::stream::global.cpu_dispatch([=] {
-        nn::cpu::axpby(A.data(), B.data(), C.data(), A.rsize(), a, b, 0.0);
+        axpbyFn(A.data(), B.data(), C.data(), A.rsize(), a, b, 0.0);
       });
     } else if (dev == device_type::gpu) {
       nn::stream::global.gpu_dispatch([=] {
@@ -832,9 +873,10 @@ void add(const data_t A, const data_t B, data_t C, float a, float b, device_type
   } else if (B.dims.size() == 1) {
     assert(A.dims.size() == C.dims.size());
     if (B.dims[0] == 1) {
-      if (dev == device_type::cpu) {
+      if (dev == device_type::cpu || dev == device_type::accelerate) {
+        auto axpbyFn = dev == device_type::accelerate ? nn::accelerate::axpby : nn::cpu::axpby;
         nn::stream::global.cpu_dispatch([=] {
-          nn::cpu::axpby(A.data(), A.data(), C.data(), A.rsize(), a, 0.0, *B.data() * b);
+          axpbyFn(A.data(), A.data(), C.data(), A.rsize(), a, 0.0, *B.data() * b);
         });
       } else if (dev == device_type::gpu) {
         nn::stream::global.gpu_dispatch([=] {
@@ -844,9 +886,10 @@ void add(const data_t A, const data_t B, data_t C, float a, float b, device_type
     } else {
       assert(B.dims[0] == A.dims[0]);
       assert(A.dims.size() == 2);
-      if (dev == device_type::cpu) {
+      if (dev == device_type::cpu || dev == device_type::accelerate) {
+        auto axpby2dBcolFn = dev == device_type::accelerate ? nn::accelerate::axpby2dBcol : nn::cpu::axpby2dBcol;
         nn::stream::global.cpu_dispatch([=] {
-          nn::cpu::axpby2dBcol(A.data(), B.data(), C.data(), A.rsize(), B.rsize(), a, b, 0.0f);
+          axpby2dBcolFn(A.data(), B.data(), C.data(), A.rsize(), B.rsize(), a, b, 0.0f);
         });
       } else if (dev == device_type::gpu) {
         nn::stream::global.gpu_dispatch([=] {
@@ -857,9 +900,10 @@ void add(const data_t A, const data_t B, data_t C, float a, float b, device_type
   } else if (A.dims.size() == 1) {
     assert(B.dims.size() == C.dims.size());
     assert(A.dims[0] == 1);
-    if (dev == device_type::cpu) {
+    if (dev == device_type::cpu || dev == device_type::accelerate) {
+      auto axpbyFn = dev == device_type::accelerate ? nn::accelerate::axpby : nn::cpu::axpby;
       nn::stream::global.cpu_dispatch([=] {
-        nn::cpu::axpby(B.data(), B.data(), C.data(), C.rsize(), 0.0, b, *A.data() * a);
+        axpbyFn(B.data(), B.data(), C.data(), C.rsize(), 0.0, b, *A.data() * a);
       });
     } else if (dev == device_type::gpu) {
       nn::stream::global.gpu_dispatch([=] {
@@ -871,19 +915,20 @@ void add(const data_t A, const data_t B, data_t C, float a, float b, device_type
   }
 }
 
-void sub(const data_t A, const data_t B, data_t C, device_type dev)
+void sub(const data_t& A, const data_t& B, data_t& C, device_type dev)
 {
   nn::tensor::add(A, B, C, 1.0, -1.0, dev);
 }
 
-void mul(const data_t A, const data_t B, data_t C, device_type dev)
+void mul(const data_t& A, const data_t& B, data_t& C, device_type dev)
 {
   if (B.dims.size() == 1 && B.size() == 1) {
     assert(A.size() == C.size());
     assert(A.dims.size() == C.dims.size());
-    if (dev == device_type::cpu) {
+    if (dev == device_type::cpu || dev == device_type::accelerate) {
+      auto axpbyFn = dev == device_type::accelerate ? nn::accelerate::axpby : nn::cpu::axpby;
       nn::stream::global.cpu_dispatch([=] {
-        nn::cpu::axpby(A.data(), A.data(), C.data(), A.rsize(), B.data()[0], 0.0, 0.0);
+        axpbyFn(A.data(), A.data(), C.data(), A.rsize(), B.data()[0], 0.0, 0.0);
       });
     } else if (dev == device_type::gpu) {
       nn::stream::global.gpu_dispatch([=] {
@@ -894,9 +939,12 @@ void mul(const data_t A, const data_t B, data_t C, device_type dev)
     assert(A.dims.size() == C.dims.size());
     assert(A.size() == C.size());
     assert(A.size() == B.size());
-    if (dev == device_type::cpu) {
+    assert(A.dims == B.dims);
+    assert(A.dims == C.dims);
+    if (dev == device_type::cpu || dev == device_type::accelerate) {
+      auto addcmulFn = dev == device_type::accelerate ? nn::accelerate::addcmul : nn::cpu::addcmul;
       nn::stream::global.cpu_dispatch([=] {
-        nn::cpu::addcmul(A.data(), B.data(), C.data(), A.rsize(), 1.0, 0.0);
+        addcmulFn(A.data(), B.data(), C.data(), A.rsize(), 1.0, 0.0);
       });
     } else if (dev == device_type::gpu) {
       nn::stream::global.gpu_dispatch([=] {
@@ -908,14 +956,15 @@ void mul(const data_t A, const data_t B, data_t C, device_type dev)
   }
 }
 
-void div(const data_t A, const data_t B, data_t C, device_type dev)
+void div(const data_t& A, const data_t& B, data_t& C, device_type dev)
 {
   if (B.dims.size() == 1 && B.size() == 1) {
     assert(A.size() == C.size());
     assert(A.dims.size() == C.dims.size());
-    if (dev == device_type::cpu) {
+    if (dev == device_type::cpu || dev == device_type::accelerate) {
+      auto axpbyFn = dev == device_type::accelerate ? nn::accelerate::axpby : nn::cpu::axpby;
       nn::stream::global.cpu_dispatch([=] {
-        nn::cpu::axpby(A.data(), A.data(), C.data(), A.rsize(), 1.0f / B.data()[0], 0.0, 0.0);
+        axpbyFn(A.data(), A.data(), C.data(), A.rsize(), 1.0f / B.data()[0], 0.0, 0.0);
       });
     } else if (dev == device_type::gpu) {
       nn::stream::global.gpu_dispatch([=] {
@@ -926,9 +975,10 @@ void div(const data_t A, const data_t B, data_t C, device_type dev)
     assert(A.dims.size() == C.dims.size());
     assert(A.size() == C.size());
     assert(A.size() == B.size());
-    if (dev == device_type::cpu) {
+    if (dev == device_type::cpu || dev == device_type::accelerate) {
+      auto addcdivFn = dev == device_type::accelerate ? nn::accelerate::addcdiv : nn::cpu::addcdiv;
       nn::stream::global.cpu_dispatch([=] {
-        nn::cpu::addcdiv(A.data(), B.data(), C.data(), A.rsize(), 1.0, 0.0);
+        addcdivFn(A.data(), B.data(), C.data(), A.rsize(), 1.0, 0.0);
       });
     } else if (dev == device_type::gpu) {
       nn::stream::global.gpu_dispatch([=] {
@@ -940,12 +990,13 @@ void div(const data_t A, const data_t B, data_t C, device_type dev)
   }
 }
 
-void sigmoid(const data_t A, data_t C, device_type dev)
+void sigmoid(const data_t& A, data_t& C, device_type dev)
 {
   assert(A.size() == C.size());
-  if (dev == device_type::cpu) {
+  if (dev == device_type::cpu || dev == device_type::accelerate) {
+    auto sigmoidFn = dev == device_type::accelerate ? nn::accelerate::sigmoid : nn::cpu::sigmoid;
     nn::stream::global.cpu_dispatch([=] {
-      nn::cpu::sigmoid(A.data(), C.data(), A.rsize());
+      sigmoidFn(A.data(), C.data(), A.rsize());
     });
   } else if (dev == device_type::gpu) {
     nn::stream::global.gpu_dispatch([=] {
@@ -954,12 +1005,13 @@ void sigmoid(const data_t A, data_t C, device_type dev)
   }
 }
 
-void sigmoidDerivative(const data_t A, data_t C, device_type dev)
+void sigmoidDerivative(const data_t& A, data_t& C, device_type dev)
 {
   assert(A.size() == C.size());
-  if (dev == device_type::cpu) {
+  if (dev == device_type::cpu || dev == device_type::accelerate) {
+    auto sigmoidDerivFn = dev == device_type::accelerate ? nn::accelerate::sigmoidDerivative : nn::cpu::sigmoidDerivative;
     nn::stream::global.cpu_dispatch([=] {
-      nn::cpu::sigmoidDerivative(A.data(), C.data(), A.rsize());
+      sigmoidDerivFn(A.data(), C.data(), A.rsize());
     });
   } else if (dev == device_type::gpu) {
     nn::stream::global.gpu_dispatch([=] {
@@ -968,38 +1020,15 @@ void sigmoidDerivative(const data_t A, data_t C, device_type dev)
   }
 }
 
-void sum(const data_t A, data_t C, int64_t dim, device_type dev)
+void sum(const data_t& A, data_t& C, int64_t dim, device_type dev)
 {
   if (dim == -1) {
     assert(C.dims.size() == 1);
     assert(C.dims[0] == 1);
-    if (dev == device_type::cpu) {
+    if (dev == device_type::cpu || dev == device_type::accelerate) {
+      auto sumFn = dev == device_type::accelerate ? nn::accelerate::sum : nn::cpu::sum;
       nn::stream::global.cpu_dispatch([=] {
-        float acc = 0;
-        // TODO: make this ifs static
-        A.spanIter([&](auto i, auto sz) {
-          if (sz % 16 == 0) {
-            simd_packed_float16* simdA = (simd_packed_float16*)(A.data() + i);
-            for (auto j = 0; j < (sz / 16); j++) {
-              acc += simd_dot(simdA[j], 1.0);
-            }
-          } else if (sz % 8 == 0) {
-            simd_packed_float8* simdA = (simd_packed_float8*)(A.data() + i);
-            for (auto j = 0; j < (sz / 8); j++) {
-              acc += simd_dot(simdA[j], 1.0);
-            }
-          } else if (sz % 4 == 0) {
-            simd_packed_float4* simdA = (simd_packed_float4*)(A.data() + i);
-            for (auto j = 0; j < (sz / 4); j++) {
-              acc += simd_dot(simdA[j], 1.0);
-            }
-          } else {
-            for (auto j = 0; j < sz; j++) {
-              acc += A.data()[i + j];
-            }
-          }
-        });
-        *C.data() = acc;
+        sumFn(A.data(), C.data(), A.rsize());
       });
     } else if (dev == device_type::gpu) {
       nn::stream::global.gpu_dispatch([=] {
@@ -1011,11 +1040,10 @@ void sum(const data_t A, data_t C, int64_t dim, device_type dev)
     assert(C.dims.size() == 1);
     if (dim == 0) {
       assert(C.dims[0] == A.dims[1]);
-      if (dev == device_type::cpu) {
+      if (dev == device_type::cpu || dev == device_type::accelerate) {
+        auto sumDim0Fn = dev == device_type::accelerate ? nn::accelerate::sum_dim0 : nn::cpu::sum_dim0;
         nn::stream::global.cpu_dispatch([=] {
-          A.rowsIter([&](auto i) {
-            C.data()[i % C.xs.dspan.shape[dim]] += A.data()[i];
-          });
+          sumDim0Fn(A.data(), C.data(), A.dims[0], A.dims[1], A.rshape()[1]);
         });
       } else if (dev == device_type::gpu) {
         nn::stream::global.gpu_dispatch([=] {
@@ -1026,11 +1054,10 @@ void sum(const data_t A, data_t C, int64_t dim, device_type dev)
       }
     } else if (dim == 1) {
       assert(C.dims[0] == A.dims[0]);
-      if (dev == device_type::cpu) {
+      if (dev == device_type::cpu || dev == device_type::accelerate) {
+        auto sumDim1Fn = dev == device_type::accelerate ? nn::accelerate::sum_dim1 : nn::cpu::sum_dim1;
         nn::stream::global.cpu_dispatch([=] {
-          A.rowsIter([&](auto i) {
-            C.data()[i / A.xs.dspan.shape[1]] += A.data()[i];
-          });
+          sumDim1Fn(A.data(), C.data(), A.dims[0], A.dims[1], A.rshape()[1]);
         });
       } else if (dev == device_type::gpu) {
         nn::stream::global.gpu_dispatch([=] {
@@ -1045,7 +1072,7 @@ void sum(const data_t A, data_t C, int64_t dim, device_type dev)
   }
 }
 
-void transpose(const data_t A, data_t C, device_type dev)
+void transpose(const data_t& A, data_t& C, device_type dev)
 {
   assert(A.dims.size() == 2);
   assert(A.dims.size() == C.dims.size());
@@ -1055,6 +1082,10 @@ void transpose(const data_t A, data_t C, device_type dev)
   if (dev == device_type::cpu) {
     nn::stream::global.cpu_dispatch([=]() {
       nn::cpu::transpose<1>(A.xs.data, C.xs.data, rshape[0], rshape[1]);
+    });
+  } else if (dev == device_type::accelerate) {
+    nn::stream::global.cpu_dispatch([=]() {
+      nn::accelerate::transpose(A.xs.data, C.xs.data, rshape[0], rshape[1]);
     });
   } else if (dev == device_type::gpu) {
     nn::stream::global.gpu_dispatch([=]() {
@@ -1097,7 +1128,7 @@ data_t data_t::copy(tensor::device_type dev) const {
   auto storage = allocator::aligned_alloc(dims);
   data_t out{dims, storage};
   auto srcBuffer = xs;
-  if (dev == tensor::device_type::cpu) {
+  if (dev == tensor::device_type::cpu || dev == tensor::device_type::accelerate) {
     nn::stream::global.cpu_dispatch([=]() {
       memcpy(storage.data, srcBuffer.data, storage.size());
     });
@@ -1113,13 +1144,13 @@ data_t data_t::copy(tensor::device_type dev) const {
 }
 
 namespace nn::helpers {
-tensor::data_t forward(std::vector<nn::layer::linear>& model, tensor::data_t& input, tensor::device_type dev)
+const tensor::data_t forward(std::vector<nn::layer::linear>& model, tensor::data_t& input, tensor::device_type dev)
 {
   auto output = input;
   for (auto& l : model) {
     output = l.forward(output, dev);
   }
-  return output.copy(dev);
+  return output;
 }
 
 template<typename dims_t>
@@ -1154,9 +1185,14 @@ Buffer aligned_alloc(shape_t shape)
   }
   
   auto area = utils::area(realShape);
-  auto mtlBuff = [gpu::device newBufferWithLength:area * sizeof(float) options:MTLResourceStorageModeShared];
-  memset(mtlBuff.contents, 0, area * sizeof(float));
-  return Buffer { mtlBuff, realShape };
+  if (false) {
+    auto mtlBuff = [gpu::device newBufferWithLength:area * sizeof(float) options:MTLResourceStorageModeShared];
+    memset(mtlBuff.contents, 0, area * sizeof(float));
+    return Buffer { mtlBuff, realShape };
+  } else {
+    std::shared_ptr<float[]> sptr{new float[area]{0.0f}};
+    return Buffer { sptr, realShape };
+  }
 }
 
 void free(Buffer buff)
@@ -1174,19 +1210,21 @@ tensor::data_t quadratic(
                          tensor::device_type dev
                          )
 {
-  auto modelOutput = nn::helpers::forward(model, inputs, dev).copy(dev);
-  modelOutput.transpose(dev);
+  const auto modelOutput = nn::helpers::forward(model, inputs, dev);
   
   auto diff = nn::tensor::data_t::zero(modelOutput.dims);
   auto cost = nn::tensor::data_t::value({0.0});
+  auto diffSquared = diff;
   
   nn::tensor::sub(modelOutput, outputs, diff, dev);
-  if (backwardInput) *backwardInput = diff.copy(dev);
-  nn::tensor::mul(diff, diff, diff, dev);
-  nn::stream::global.synchronize();
+  if (backwardInput) {
+    *backwardInput = diff;
+    diffSquared = nn::tensor::data_t{diffSquared.dims};
+  }
+  nn::tensor::mul(diff, diff, diffSquared, dev);
   
-  nn::tensor::sum(diff, cost, -1, dev);
-  nn::tensor::div(cost, nn::tensor::data_t::value({(float)2 * outputs.dims[0]}), cost, dev);
+  nn::tensor::sum(diffSquared, cost, -1, dev);
+  nn::tensor::div(cost, nn::tensor::data_t::value({(float)2 * outputs.dims[1]}), cost, dev);
   // nn::stream::global.gpuFlush();
   
   return cost;
@@ -1205,34 +1243,35 @@ inline void ctx_t::gpuFlush()
 
 inline void ctx_t::synchronize()
 {
-  gpuFlush();
-  [event waitUntilSignaledValue:last_id timeoutMS:-1];
+  // gpuFlush();
+  // [event waitUntilSignaledValue:last_id timeoutMS:-1];
   // std::cout << "sync w8=" << event.signaledValue << " sig=" << last_id << std::endl;
   
-  event = [gpu::device newSharedEvent];
-  listener = [[MTLSharedEventListener alloc] initWithDispatchQueue:cpu::queue];
-  last_id = 0;
+  // event = [gpu::device newSharedEvent];
+  // listener = [[MTLSharedEventListener alloc] initWithDispatchQueue:cpu::queue];
+  // last_id = 0;
 }
 
-inline void ctx_t::cpu_dispatch(std::function<void()> block)
+template<typename block_t>
+inline void ctx_t::cpu_dispatch(block_t block)
 {
   assert(!dispatch_queue_get_label(DISPATCH_CURRENT_QUEUE_LABEL) ||
          strcmp(dispatch_queue_get_label(DISPATCH_CURRENT_QUEUE_LABEL),
                 dispatch_queue_get_label(cpu::queue)) != 0
          && "cpu_dispatch called from within a cpu worker callback — this causes non-monotonic event signaling");
-  auto val = last_id;
-  if (lastCommandCpu.has_value() && *lastCommandCpu == false) {
-    gpuFlush();
-    dispatch_async(cpu::queue, ^() {
-      [event waitUntilSignaledValue:val timeoutMS:-1];
-    });
-  }
-  lastCommandCpu = true;
-  dispatch_async(cpu::queue, ^() {
+  // auto val = last_id;
+  // if (lastCommandCpu.has_value() && *lastCommandCpu == false) {
+  //   gpuFlush();
+  //   dispatch_async(cpu::queue, ^() {
+  //     [event waitUntilSignaledValue:val timeoutMS:-1];
+  //   });
+  // }
+  // lastCommandCpu = true;
+  // dispatch_async(cpu::queue, ^() {
     block();
-    event.signaledValue = val + 1;
-  });
-  last_id += 1;
+  //   event.signaledValue = val + 1;
+  // });
+  // last_id += 1;
 }
 
 inline void ctx_t::gpu_dispatch(std::function<void()> block)
@@ -1508,6 +1547,159 @@ void axpby2dBcol(const float* x, const float* y, float* output, int64_t N, int64
   for (int64_t i = 0; i < N; i++) {
     output[i] = x[i] * fX + y[i / strideB] * fY + a;
   }
+}
+
+void sum(const float* x, float* output, int64_t N)
+{
+  float acc = 0;
+  int64_t i = 0;
+  for (; i + 16 <= N; i += 16) {
+    acc += simd_dot(*(simd_packed_float16*)(x + i), 1.0f);
+  }
+  for (; i + 8 <= N; i += 8) {
+    acc += simd_dot(*(simd_packed_float8*)(x + i), 1.0f);
+  }
+  for (; i + 4 <= N; i += 4) {
+    acc += simd_dot(*(simd_packed_float4*)(x + i), 1.0f);
+  }
+  for (; i < N; i++) {
+    acc += x[i];
+  }
+  *output = acc;
+}
+
+void sum_dim0(const float* x, float* output, int64_t Nrows, int64_t Ncols, int64_t stride)
+{
+  for (int64_t row = 0; row < Nrows; row++) {
+    for (int64_t col = 0; col < Ncols; col++) {
+      output[col] += x[row * stride + col];
+    }
+  }
+}
+
+void sum_dim1(const float* x, float* output, int64_t Nrows, int64_t Ncols, int64_t stride)
+{
+  for (int64_t row = 0; row < Nrows; row++) {
+    for (int64_t col = 0; col < Ncols; col++) {
+      output[row] += x[row * stride + col];
+    }
+  }
+}
+}
+
+namespace nn::accelerate {
+
+void gemm(const float* A, const float* B, float* C, int64_t M, int64_t N, int64_t P, bool transposeB)
+{
+  cblas_sgemm(CblasRowMajor,
+              CblasNoTrans, transposeB ? CblasTrans : CblasNoTrans,
+              (int)M, (int)P, (int)N,
+              1.0f, A, (int)N, B, transposeB ? (int)N : (int)P,
+              0.0f, C, (int)P);
+}
+
+void gemv(const float* mat, const float* vec, float* output, uint64_t M, uint64_t N)
+{
+  cblas_sgemv(CblasRowMajor, CblasNoTrans,
+              (int)M, (int)N,
+              1.0f, mat, (int)N, vec, 1,
+              0.0f, output, 1);
+}
+
+void dot(const float* x, const float* y, float* output, int64_t N)
+{
+  *output = cblas_sdot((int)N, x, 1, y, 1);
+}
+
+void axpby(const float* x, const float* y, float* output, int64_t N, float fX, float fY, float a)
+{
+  if (output != x && output != y) {
+    memset(output, 0, N * sizeof(float));
+    catlas_saxpby((int)N, fX, x, 1, 0.0f, output, 1);
+    cblas_saxpy((int)N, fY, y, 1, output, 1);
+  } else if (output == y) {
+    catlas_saxpby((int)N, fX, x, 1, fY, output, 1);
+  } else {
+    // output == x
+    catlas_saxpby((int)N, fY, y, 1, fX, output, 1);
+  }
+  if (a != 0.0f) {
+    vDSP_vsadd(output, 1, &a, output, 1, (vDSP_Length)N);
+  }
+}
+
+void axpby2dBcol(const float* x, const float* y, float* output, int64_t N, int64_t NB,
+                 float fX, float fY, float a)
+{
+  // No direct Accelerate equivalent for broadcast pattern
+  nn::cpu::axpby2dBcol(x, y, output, N, NB, fX, fY, a);
+}
+
+void axpy(const float* x, const float* y, float* output, int64_t N, float a)
+{
+  if (output != y) {
+    memcpy(output, y, N * sizeof(float));
+  }
+  cblas_saxpy((int)N, a, x, 1, output, 1);
+}
+
+void addcmul(const float* x, const float* y, float* output, int64_t N, float a, float b)
+{
+  vDSP_vmul(x, 1, y, 1, output, 1, (vDSP_Length)N);
+  if (a != 1.0f) {
+    vDSP_vsmul(output, 1, &a, output, 1, (vDSP_Length)N);
+  }
+  if (b != 0.0f) {
+    vDSP_vsadd(output, 1, &b, output, 1, (vDSP_Length)N);
+  }
+}
+
+void addcdiv(const float* x, const float* y, float* output, int64_t N, float a, float b)
+{
+  // vDSP_vdiv: note reversed arg order — divides B by A
+  vDSP_vdiv(y, 1, x, 1, output, 1, (vDSP_Length)N);
+  if (a != 1.0f) {
+    vDSP_vsmul(output, 1, &a, output, 1, (vDSP_Length)N);
+  }
+  if (b != 0.0f) {
+    vDSP_vsadd(output, 1, &b, output, 1, (vDSP_Length)N);
+  }
+}
+
+void sigmoid(const float* x, float* output, int64_t N)
+{
+  // No direct vDSP sigmoid; reuse SIMD implementation
+  nn::cpu::sigmoid(x, output, N);
+}
+
+void sigmoidDerivative(const float* x, float* output, int64_t N)
+{
+  nn::cpu::sigmoidDerivative(x, output, N);
+}
+
+void sum(const float* x, float* output, int64_t N)
+{
+  vDSP_sve(x, 1, output, (vDSP_Length)N);
+}
+
+void sum_dim0(const float* x, float* output, int64_t Nrows, int64_t Ncols, int64_t stride)
+{
+  memcpy(output, x, Ncols * sizeof(float));
+  for (int64_t row = 1; row < Nrows; row++) {
+    vDSP_vadd(x + row * stride, 1, output, 1, output, 1, (vDSP_Length)Ncols);
+  }
+}
+
+void sum_dim1(const float* x, float* output, int64_t Nrows, int64_t Ncols, int64_t stride)
+{
+  for (int64_t row = 0; row < Nrows; row++) {
+    vDSP_sve(x + row * stride, 1, &output[row], (vDSP_Length)Ncols);
+  }
+}
+
+void transpose(const float* m, float* mT, int64_t M, int64_t N)
+{
+  vDSP_mtrans(m, 1, mT, 1, (vDSP_Length)N, (vDSP_Length)M);
 }
 }
 

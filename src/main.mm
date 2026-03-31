@@ -139,11 +139,11 @@ bool load_model(std::vector<nn::layer::linear>& layers, const std::string& filen
 
 int main()
 {
-  auto device = nn::tensor::device_type::cpu;
-  auto train_loader = nn::train::data_loader{"/Users/vz/Developer/learn/informatics/ml/nntel/assets/mnist_png/training", 10, true};
+  auto device = nn::tensor::device_type::accelerate;
+  auto train_loader = nn::train::data_loader{"/Users/vz/Developer/learn/informatics/ml/nntel/assets/mnist_png/training", 20, true};
   auto test_loader = nn::train::data_loader{"/Users/vz/Developer/learn/informatics/ml/nntel/assets/mnist_png/testing", -1, false};
 
-  auto model = nn::helpers::buildModel({784, 128, 10});
+  auto model = nn::helpers::buildModel({784, 100, 10});
 
   auto testdata = test_loader.nextBatch();
   test_loader.reset();
@@ -158,7 +158,6 @@ int main()
     while ((batch = train_loader.nextBatch())) @autoreleasepool {
       // std::println("{} {}", nn::utils::xs2str(batch->first.dims), nn::utils::xs2str(batch->second.dims));
       auto cost = nn::cost::quadratic(model, batch->first, batch->second, &bi, device);
-      bi.transpose();
       for (int64_t i = model.size() - 1; i >= 0; i--) {
         bi = model[i].backward(bi, device);
       }
@@ -172,22 +171,5 @@ int main()
     nn::stream::global.synchronize();
     std::cout << "cost = " << *cost.data() << std::endl;
   }
-  // for (int64_t e = 0; e < 128; e++) {
-  //   for (int64_t i = model.size() - 1; i >= 0; i--) {
-  //     bi = model[i].backward(bi);
-  //   }
-  //   for (int64_t i = model.size() - 1; i >= 0; i--) {
-  //     model[i].applyGrad();
-  //   }
-  //   cost = nn::cost::quadratic(model, samples.first, samples.second, bi);
-  //   bi.transpose();
-  //   nn::stream::global.synchronize();
-  //   std::cout << "cost = " << *cost.data() << std::endl;
-  // }
-
   return 0;
-  
-  // for (auto i = model.size() - 1; i >= 0; i--) {
-  //   
-  // }
 }
