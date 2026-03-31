@@ -299,7 +299,6 @@ struct Buffer {
   }
 
   id<MTLBuffer> buff() const {
-    assert(false);
     return mtl;
   }
   
@@ -415,23 +414,27 @@ void transpose(const data_t& A, data_t& C, device_type dev=device_type::cpu);
 }
 
 namespace layer {
-struct linear {
+struct base {
+virtual tensor::data_t forward(const tensor::data_t& input, tensor::device_type dev) = 0;
+virtual tensor::data_t backward(const tensor::data_t& input, tensor::device_type dev) = 0;
+virtual void applyGrad(tensor::device_type) {}
+virtual ~base() = default;
+};
+
+struct linear : public base {
   tensor::data_t weights;
   tensor::data_t biases;
   tensor::data_t zs;
-  tensor::data_t as;
   
   std::optional<tensor::data_t> dweights;
   std::optional<tensor::data_t> dbiases;
   std::optional<tensor::data_t> input;
-  std::optional<tensor::data_t> error;
   tensor::data_t tweights;
   
   linear(int64_t inputsCount, int64_t outputsCount)
   : weights(tensor::data_t::random({outputsCount, inputsCount}, std::sqrt(2.0f / (inputsCount + outputsCount))))
   , biases(tensor::data_t::zero({outputsCount}))
   , zs(tensor::data_t::zero({outputsCount}))
-  , as(tensor::data_t::zero({outputsCount}))
   , tweights(tensor::data_t{inputsCount, outputsCount})
   {}
   
@@ -439,7 +442,6 @@ struct linear {
   : weights(weights)
   , biases(biases)
   , zs(tensor::data_t::zero({biases.size()}))
-  , as(tensor::data_t::zero({biases.size()}))
   , tweights(tensor::data_t{weights.dims[1], weights.dims[0]})
   {
     assert(weights.dims.size() == 2);
@@ -447,7 +449,7 @@ struct linear {
     assert(weights.dims[0] == biases.dims[0]);
   }
   
-  tensor::data_t forward(const tensor::data_t& input, tensor::device_type dev)
+  tensor::data_t forward(const tensor::data_t& input, tensor::device_type dev) override
   {
     std::vector<int64_t> dims;
     dims.push_back(biases.size());
@@ -456,44 +458,73 @@ struct linear {
     }
     if (dims != zs.dims) {
       zs = tensor::data_t(dims);
-      as = tensor::data_t(dims);
     }
     this->input = input;
     matmul(weights, input, zs, dev);
     add(zs, biases, zs, 1.0, 1.0, dev);
-    sigmoid(zs, as, dev);
     // nn::stream::global.gpuFlush();
-    return as;
+    return zs;
   }
   
-  tensor::data_t backward(const tensor::data_t input, tensor::device_type dev)
+  tensor::data_t backward(const tensor::data_t& input, tensor::device_type dev) override
   {
-    nn::tensor::sigmoidDerivative(zs, zs, dev);
-    
-    error = tensor::data_t{input.dims};
-    nn::tensor::mul(input, zs, error.value(), dev);
-    
     tensor::transpose(weights, tweights, dev);
-    tensor::data_t output = tensor::data_t::zero({tweights.dims[0], error->dims[1]});
-    nn::tensor::matmul(tweights, *error, output, dev);
+    tensor::data_t output = tensor::data_t::zero({tweights.dims[0], input.dims[1]});
+    nn::tensor::matmul(tweights, input, output, dev);
     
     dweights = tensor::data_t::zero({weights.dims[0], weights.dims[1]});
     dbiases = tensor::data_t::zero({biases.dims[0]});
     
     (*(this->input)).transpose();
     
-    tensor::matmul(*error, *(this->input), *dweights, dev);
-    tensor::sum(*error, *dbiases, 1, dev);
+    tensor::matmul(input, *(this->input), *dweights, dev);
+    tensor::sum(input, *dbiases, 1, dev);
     
     return output;
   }
   
-  void applyGrad(tensor::device_type dev)
+  void applyGrad(tensor::device_type dev) override
   {
     tensor::add(weights, *dweights, weights, 1.0, -1.0 / (2.0 * zs.dims[1]), dev);
     tensor::add(biases, *dbiases, biases, 1.0, -1.0 / (2.0 * zs.dims[1]), dev);
   }
-  
+};
+
+struct sigmoid : public base {
+  sigmoid(int64_t size)
+  : size(size)
+  {}
+
+  tensor::data_t forward(const tensor::data_t& input, tensor::device_type dev) override
+  {
+    std::vector<int64_t> dims;
+    dims.push_back(size);
+    if (input.dims.size() == 2) {
+      dims.push_back(input.dims.back());
+    }
+    if (output.has_value() == false || output.value().dims != dims) {
+      output = tensor::data_t(dims);
+    }
+    tensor::sigmoid(input, *output, dev);
+    this->input = input;
+    return *output;
+  }
+
+  tensor::data_t backward(const tensor::data_t& input, tensor::device_type dev) override
+  {
+    nn::tensor::sigmoidDerivative(*(this->input), *(this->input), dev);
+
+    error = tensor::data_t{input.dims};
+    nn::tensor::mul(input, *(this->input), *error, dev);
+
+    return *error;
+  }
+
+  private:
+  int64_t size;
+  std::optional<tensor::data_t> output;
+  std::optional<tensor::data_t> input;
+  std::optional<tensor::data_t> error;
 };
 }
 
@@ -501,12 +532,12 @@ namespace helpers {
 const tensor::data_t forward(std::vector<nn::layer::linear>& model, const tensor::data_t& input, tensor::device_type);
 
 template<typename dims_t>
-std::vector<nn::layer::linear> buildModel(dims_t dims);
+std::vector<std::unique_ptr<nn::layer::base>> buildModel(dims_t dims);
 }
 
 namespace cost {
 tensor::data_t quadratic(
-                         std::vector<nn::layer::linear>& model,
+                         std::vector<std::unique_ptr<nn::layer::base>>& model,
                          tensor::data_t& inputs,
                          const tensor::data_t& outputs,
                          tensor::data_t* backwardInput,
@@ -1144,31 +1175,23 @@ data_t data_t::copy(tensor::device_type dev) const {
 }
 
 namespace nn::helpers {
-const tensor::data_t forward(std::vector<nn::layer::linear>& model, tensor::data_t& input, tensor::device_type dev)
+const tensor::data_t forward(std::vector<std::unique_ptr<nn::layer::base>>& model, tensor::data_t& input, tensor::device_type dev)
 {
   auto output = input;
   for (auto& l : model) {
-    output = l.forward(output, dev);
+    output = l->forward(output, dev);
   }
   return output;
 }
 
 template<typename dims_t>
 // 784 100 10
-std::vector<nn::layer::linear> buildModel(dims_t dims)
+std::vector<std::unique_ptr<nn::layer::base>> buildModel(dims_t dims)
 {
-  std::vector<nn::layer::linear> model;
+  std::vector<std::unique_ptr<nn::layer::base>> model;
   for (uint i = 0; i < dims.size() - 1; i++) {
-    model.emplace_back(dims.at(i), dims.at(i + 1));
-  }
-  return model;
-}
-
-std::vector<nn::layer::linear> buildModel(std::initializer_list<int64_t> dims)
-{
-  std::vector<nn::layer::linear> model;
-  for (uint i = 0; i < dims.size() - 1; i++) {
-    model.emplace_back(dims.begin()[i], dims.begin()[i + 1]);
+    model.emplace_back(std::make_unique<nn::layer::linear>(dims.at(i), dims.at(i + 1)));
+    model.emplace_back(std::make_unique<nn::layer::sigmoid>(dims.at(i + 1)));
   }
   return model;
 }
@@ -1203,7 +1226,7 @@ void free(Buffer buff)
 
 namespace nn::cost {
 tensor::data_t quadratic(
-                         std::vector<nn::layer::linear>& model,
+                         std::vector<std::unique_ptr<nn::layer::base>>& model,
                          tensor::data_t& inputs,
                          const tensor::data_t& outputs,
                          tensor::data_t* backwardInput,
@@ -1243,13 +1266,13 @@ inline void ctx_t::gpuFlush()
 
 inline void ctx_t::synchronize()
 {
-  // gpuFlush();
-  // [event waitUntilSignaledValue:last_id timeoutMS:-1];
+  gpuFlush();
+  [event waitUntilSignaledValue:last_id timeoutMS:-1];
   // std::cout << "sync w8=" << event.signaledValue << " sig=" << last_id << std::endl;
   
-  // event = [gpu::device newSharedEvent];
-  // listener = [[MTLSharedEventListener alloc] initWithDispatchQueue:cpu::queue];
-  // last_id = 0;
+  event = [gpu::device newSharedEvent];
+  listener = [[MTLSharedEventListener alloc] initWithDispatchQueue:cpu::queue];
+  last_id = 0;
 }
 
 template<typename block_t>
@@ -1259,19 +1282,19 @@ inline void ctx_t::cpu_dispatch(block_t block)
          strcmp(dispatch_queue_get_label(DISPATCH_CURRENT_QUEUE_LABEL),
                 dispatch_queue_get_label(cpu::queue)) != 0
          && "cpu_dispatch called from within a cpu worker callback — this causes non-monotonic event signaling");
-  // auto val = last_id;
-  // if (lastCommandCpu.has_value() && *lastCommandCpu == false) {
-  //   gpuFlush();
-  //   dispatch_async(cpu::queue, ^() {
-  //     [event waitUntilSignaledValue:val timeoutMS:-1];
-  //   });
-  // }
-  // lastCommandCpu = true;
-  // dispatch_async(cpu::queue, ^() {
+  auto val = last_id;
+  if (lastCommandCpu.has_value() && *lastCommandCpu == false) {
+    gpuFlush();
+    dispatch_async(cpu::queue, ^() {
+      [event waitUntilSignaledValue:val timeoutMS:-1];
+    });
+  }
+  lastCommandCpu = true;
+  dispatch_async(cpu::queue, ^() {
     block();
-  //   event.signaledValue = val + 1;
-  // });
-  // last_id += 1;
+    event.signaledValue = val + 1;
+  });
+  last_id += 1;
 }
 
 inline void ctx_t::gpu_dispatch(std::function<void()> block)
