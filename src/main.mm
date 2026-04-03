@@ -139,7 +139,7 @@ bool load_model(std::vector<nn::layer::linear>& layers, const std::string& filen
 
 int main()
 {
-  auto device = nn::tensor::device_type::accelerate;
+  auto device = nn::tensor::device_type::gpu;
   auto train_loader = nn::train::data_loader{"/Users/vz/Developer/learn/informatics/ml/nntel/assets/mnist_png/training", 20, true};
   auto test_loader = nn::train::data_loader{"/Users/vz/Developer/learn/informatics/ml/nntel/assets/mnist_png/testing", -1, false};
 

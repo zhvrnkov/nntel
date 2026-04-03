@@ -472,10 +472,15 @@ struct linear : public base {
     tensor::data_t output = tensor::data_t::zero({tweights.dims[0], input.dims[1]});
     nn::tensor::matmul(tweights, input, output, dev);
     
-    dweights = tensor::data_t::zero({weights.dims[0], weights.dims[1]});
-    dbiases = tensor::data_t::zero({biases.dims[0]});
+    if (dweights.has_value() == false) {
+      dweights = tensor::data_t::zero({weights.dims[0], weights.dims[1]});
+    }
+    if (dbiases.has_value() == false) {
+      dbiases = tensor::data_t({biases.dims[0]});
+    }
+//    memset(dbiases->data(), 0, dbiases->rsize() * sizeof(float));
     
-    (*(this->input)).transpose();
+    (*(this->input)).transpose(dev);
     
     tensor::matmul(input, *(this->input), *dweights, dev);
     tensor::sum(input, *dbiases, 1, dev);
@@ -1208,7 +1213,7 @@ Buffer aligned_alloc(shape_t shape)
   }
   
   auto area = utils::area(realShape);
-  if (false) {
+  if (true) {
     auto mtlBuff = [gpu::device newBufferWithLength:area * sizeof(float) options:MTLResourceStorageModeShared];
     memset(mtlBuff.contents, 0, area * sizeof(float));
     return Buffer { mtlBuff, realShape };
@@ -1247,7 +1252,7 @@ tensor::data_t quadratic(
   nn::tensor::mul(diff, diff, diffSquared, dev);
   
   nn::tensor::sum(diffSquared, cost, -1, dev);
-  nn::tensor::div(cost, nn::tensor::data_t::value({(float)2 * outputs.dims[1]}), cost, dev);
+  nn::tensor::div(cost, nn::tensor::data_t::value({(float)2 * outputs.dims[1]}), cost, tensor::device_type::cpu);
   // nn::stream::global.gpuFlush();
   
   return cost;
@@ -1727,56 +1732,74 @@ void transpose(const float* m, float* mT, int64_t M, int64_t N)
 }
 
 namespace nn::gpu {
-void gemm(id<MTLCommandBuffer> cmd, id<MTLBuffer> A, id<MTLBuffer> B, id<MTLBuffer> C, uint64_t m, uint64_t n, uint64_t p)
+void gemm(id<MTLCommandBuffer> cmd, id<MTLBuffer> A, id<MTLBuffer> B, id<MTLBuffer> C, uint64_t M, uint64_t N, uint64_t P)
 {
-  static id<MTLComputePipelineState> kernel_dim2;
-  static id<MTLComputePipelineState> kernel_dim4;
+  int dim = -1;
+  int simdim = 1;
+  bool aligned = false;
+  
+  aligned = M % 8 == 0 && P % 8 == 0 && N % 8 == 0;
+  if (aligned) {
+    if (M % 8 == 0 && P % 8 == 0) dim = 1;
+    if (M % 16 == 0 && P % 16 == 0) dim = 2;
+    if (M % 32 == 0 && P % 32 == 0) dim = 4;
+    
+    if (M % (dim * 8 * 2) == 0) simdim = 2;
+  } else {
+    dim = 1;
+    if (M > 16 && P > 16) dim = 2;
+    if (M > 32 && P > 32) dim = 4;
+    
+    // simdim = 2 is slower
+    //    if (M > (dim * 8 * 2)) simdim = 2;
+  }
+  
+  static NSMutableArray* aligned_kernels = [NSMutableArray new];
+  static NSMutableArray* noaligned_kernels = [NSMutableArray new];
   static dispatch_once_t onceToken;
   dispatch_once(&onceToken, ^{
-    auto kernelFuncDim2 = [lib newFunctionWithName:@"sgemm_32x32_unrolled_dim2"];
-    auto kernelFuncDim4 = [lib newFunctionWithName:@"sgemm_32x32_unrolled_dim4"];
-    kernel_dim2 = [device newComputePipelineStateWithFunction:kernelFuncDim2 error:nil];
-    kernel_dim4 = [device newComputePipelineStateWithFunction:kernelFuncDim4 error:nil];
+    auto func1 = [gpu::lib newFunctionWithName:@"sgemm_unrolled_dim1"];
+    auto func2 = [gpu::lib newFunctionWithName:@"sgemm_unrolled_dim2"];
+    auto func4 = [gpu::lib newFunctionWithName:@"sgemm_unrolled_dim4"];
+    [aligned_kernels addObject:[gpu::device newComputePipelineStateWithFunction:func1 error:nil]];
+    [aligned_kernels addObject:[gpu::device newComputePipelineStateWithFunction:func2 error:nil]];
+    [aligned_kernels addObject:[gpu::device newComputePipelineStateWithFunction:func4 error:nil]];
+    
+    auto func0 = [gpu::lib newFunctionWithName:@"sgemm"];
+    func1 = [gpu::lib newFunctionWithName:@"sgemm_na_unrolled_dim1"];
+    func2 = [gpu::lib newFunctionWithName:@"sgemm_na_unrolled_dim2"];
+    func4 = [gpu::lib newFunctionWithName:@"sgemm_na_unrolled_dim4"];
+    [noaligned_kernels addObject:[gpu::device newComputePipelineStateWithFunction:func1 error:nil]];
+    [noaligned_kernels addObject:[gpu::device newComputePipelineStateWithFunction:func2 error:nil]];
+    [noaligned_kernels addObject:[gpu::device newComputePipelineStateWithFunction:func4 error:nil]];
   });
-  if (!kernel_dim2 || !kernel_dim4) {
+  if (aligned_kernels.count <= 0 || noaligned_kernels.count <= 0) {
     NSLog(@"got error during pipeline creation");
     return;
   }
-
-  auto kernel = kernel_dim2;
-  uint64_t dim = 2;
-  uint64_t block_size = dim * 8;
-  uint64_t block_size_m = dim * 8 * 2;
   
-  assert(m >= block_size_m && "M must be at least 64");
-  assert(n >= 8 && "N must be at least 8");
-  assert(p >= block_size && "P must be at least 32");
-  assert(m % block_size_m == 0 && "M must be divisible by 64");
-  assert(n % 8 == 0 && "N must be divisible by 8");
-  assert(p % block_size == 0 && "P must be divisible by 32");
-  
-  if (m >= (block_size_m * 2) && p >= (block_size * 2) && m % (block_size_m * 2) == 0 && p % (block_size * 2) == 0) {
-    kernel = kernel_dim4;
-    dim = 4;
-    block_size = dim * 8;
-    block_size_m = dim * 8 * 2;
-  }
-  
+  auto xdim = dim * 8;
+  auto ydim = xdim * simdim;
   MTLSize tgroupSize;
   tgroupSize.width = 32;
-  tgroupSize.height = 2;
+  tgroupSize.height = simdim;
   tgroupSize.depth = 1;
   auto encoder = [cmd computeCommandEncoder];
   
   [encoder setBuffer:A offset:0 atIndex:0];
   [encoder setBuffer:B offset:0 atIndex:1];
   [encoder setBuffer:C offset:0 atIndex:2];
-  [encoder setBytes:(void*)&m length:sizeof(m) atIndex:3];
-  [encoder setBytes:(void*)&n length:sizeof(n) atIndex:4];
-  [encoder setBytes:(void*)&p length:sizeof(p) atIndex:5];
-  [encoder setComputePipelineState:kernel];
-  [encoder dispatchThreadgroups:MTLSizeMake(p / block_size, m / block_size_m, 1) 
-          threadsPerThreadgroup:tgroupSize];
+  [encoder setBytes:(void*)&M length:sizeof(M) atIndex:3];
+  [encoder setBytes:(void*)&N length:sizeof(N) atIndex:4];
+  [encoder setBytes:(void*)&P length:sizeof(P) atIndex:5];
+  if (aligned == false) {
+    auto matsize = 8 * 8 * sizeof(float);
+    [encoder setThreadgroupMemoryLength:(dim * simdim * matsize) atIndex:0];
+    [encoder setThreadgroupMemoryLength:(dim * simdim * matsize) atIndex:1];
+    [encoder setThreadgroupMemoryLength:(dim * dim * simdim * matsize) atIndex:2];
+  }
+  [encoder setComputePipelineState:(aligned ? aligned_kernels : noaligned_kernels)[(int)log2(dim)]];
+  [encoder dispatchThreadgroups:MTLSizeMake((P + xdim - 1) / xdim, (M + ydim - 1) / ydim, 1) threadsPerThreadgroup:tgroupSize];
   
   [encoder endEncoding];
 }
@@ -1784,11 +1807,6 @@ void gemm(id<MTLCommandBuffer> cmd, id<MTLBuffer> A, id<MTLBuffer> B, id<MTLBuff
 void gemv(id<MTLCommandBuffer> cmd, id<MTLBuffer> mat, id<MTLBuffer> vec, id<MTLBuffer> output,
           uint64_t m, uint64_t n)
 {
-  assert(m >= 2 && "M (height) must be at least 2");
-  assert(n >= 64 && "N (width) must be at least 64");
-  assert(m % 2 == 0 && "M (height) must be divisible by 2");
-  assert(n % 64 == 0 && "N (width) must be divisible by 64");
-  
   static id<MTLComputePipelineState> kernel;
   static dispatch_once_t onceToken;
   dispatch_once(&onceToken, ^{
@@ -1816,7 +1834,7 @@ void gemv(id<MTLCommandBuffer> cmd, id<MTLBuffer> mat, id<MTLBuffer> vec, id<MTL
   //    [encoder setThreadgroupMemoryLength:tgroupSize.width * sizeof(float) atIndex:0];
   [encoder setComputePipelineState:kernel];
   
-  [encoder dispatchThreadgroups:MTLSizeMake(1, H / tgroupSize.height, 1) threadsPerThreadgroup:tgroupSize];
+  [encoder dispatchThreadgroups:MTLSizeMake(1, (H + tgroupSize.height - 1) / tgroupSize.height, 1) threadsPerThreadgroup:tgroupSize];
   [encoder endEncoding];
 }
 
@@ -1827,45 +1845,32 @@ void dot(id<MTLCommandBuffer> cmd, id<MTLBuffer> x, id<MTLBuffer> y, id<MTLBuffe
   assert(N % 4 == 0);
   
   static id<MTLComputePipelineState> kernel0;
-  static id<MTLComputePipelineState> kernel1;
   static dispatch_once_t onceToken;
   dispatch_once(&onceToken, ^{
-    auto kernel0Func = [gpu::lib newFunctionWithName:@"dot_reduce0"];
-    auto kernel1Func = [gpu::lib newFunctionWithName:@"dot_reduce1"];
+    auto kernel0Func = [gpu::lib newFunctionWithName:@"dot"];
     kernel0 = [gpu::device newComputePipelineStateWithFunction:kernel0Func error:nil];
-    kernel1 = [gpu::device newComputePipelineStateWithFunction:kernel1Func error:nil];
   });
-  if (!kernel0 || !kernel1) {
+  if (!kernel0) {
     NSLog(@"got error during pipeline creation");
     return;
   }
   
-  auto totalThreads = N / (4 * 2);
-  auto threadsPerThreadgroup = MTLSizeMake(totalThreads > 1024 ? 1024 : totalThreads, 1, 1);
+  auto totalThreads = (N + 7) / 8;
+  auto threadsPerThreadgroup = MTLSizeMake(totalThreads > 1024 ? 1024 : 1 << ((int)ceil(log2(totalThreads))), 1, 1);
   auto threadgroupMemFloats = threadsPerThreadgroup.width * 2;
-  auto threadgroupsWidth = totalThreads / threadsPerThreadgroup.width;
+  auto threadgroupsWidth = (totalThreads + threadsPerThreadgroup.width - 1) / threadsPerThreadgroup.width;
   auto threadgroups = MTLSizeMake(threadgroupsWidth, 1, 1);
-  id<MTLBuffer> interm = [gpu::device newBufferWithLength:threadgroups.width * sizeof(float) options:MTLResourceStorageModePrivate];
   
   auto tgroupmemSize = threadgroupMemFloats * sizeof(float);
   tgroupmemSize = ((tgroupmemSize + 15) / 16) * 16;
   auto encoder = [cmd computeCommandEncoder];
   [encoder setBuffer:x offset:0 atIndex:0];
   [encoder setBuffer:y offset:0 atIndex:1];
-  [encoder setBuffer:interm offset:0 atIndex:2];
+  [encoder setBuffer:output offset:0 atIndex:2];
   [encoder setBytes:(void*)&N length:sizeof(N) atIndex:3];
   [encoder setThreadgroupMemoryLength:tgroupmemSize atIndex:0];
   [encoder setComputePipelineState:kernel0];
   [encoder dispatchThreadgroups:threadgroups threadsPerThreadgroup:threadsPerThreadgroup];
-  
-  tgroupmemSize = threadgroupsWidth * sizeof(float);
-  tgroupmemSize = ((tgroupmemSize + 15) / 16) * 16;
-  [encoder setBuffer:interm offset:0 atIndex:0];
-  [encoder setBuffer:output offset:0 atIndex:1];
-  [encoder setBytes:(void*)&threadgroupsWidth length:sizeof(threadgroupsWidth) atIndex:2];
-  [encoder setThreadgroupMemoryLength:tgroupmemSize atIndex:0];
-  [encoder setComputePipelineState:kernel1];
-  [encoder dispatchThreads:MTLSizeMake(threadgroupsWidth, 1, 1) threadsPerThreadgroup:MTLSizeMake(threadgroupsWidth, 1, 1)];
   
   [encoder endEncoding];
 }
@@ -1875,25 +1880,21 @@ void sum(id<MTLCommandBuffer> cmd, id<MTLBuffer> X, float y, id<MTLBuffer> outpu
   const uint64_t N = X.length / sizeof(float);
   
   static id<MTLComputePipelineState> kernel0;
-  static id<MTLComputePipelineState> kernel1;
   static dispatch_once_t onceToken;
   dispatch_once(&onceToken, ^{
-    auto kernel0Func = [lib newFunctionWithName:@"sum_reduce0"];
-    auto kernel1Func = [lib newFunctionWithName:@"dot_reduce1"];
-    kernel0 = [device newComputePipelineStateWithFunction:kernel0Func error:nil];
-    kernel1 = [device newComputePipelineStateWithFunction:kernel1Func error:nil];
+    auto kernel0Func = [gpu::lib newFunctionWithName:@"sum"];
+    kernel0 = [gpu::device newComputePipelineStateWithFunction:kernel0Func error:nil];
   });
-  if (!kernel0 || !kernel1) {
+  if (!kernel0) {
     NSLog(@"got error during pipeline creation");
     return;
   }
   
-  auto totalThreads = N / (4 * 2);
-  auto threadsPerThreadgroup = MTLSizeMake(totalThreads > 1024 ? 1024 : totalThreads, 1, 1);
+  auto totalThreads = (N + 7) / 8;
+  auto threadsPerThreadgroup = MTLSizeMake(totalThreads > 1024 ? 1024 : 1 << ((int)ceil(log2(totalThreads))), 1, 1);
   auto threadgroupMemFloats = threadsPerThreadgroup.width * 2;
-  auto threadgroupsWidth = totalThreads / threadsPerThreadgroup.width;
+  auto threadgroupsWidth = (totalThreads + threadsPerThreadgroup.width - 1) / threadsPerThreadgroup.width;
   auto threadgroups = MTLSizeMake(threadgroupsWidth, 1, 1);
-  id<MTLBuffer> interm = [gpu::device newBufferWithLength:threadgroups.width * sizeof(float) options:MTLResourceStorageModePrivate];
   
   auto encoder = [cmd computeCommandEncoder];
   auto tgroupmemSize = threadgroupMemFloats * sizeof(float);
@@ -1901,20 +1902,11 @@ void sum(id<MTLCommandBuffer> cmd, id<MTLBuffer> X, float y, id<MTLBuffer> outpu
   
   [encoder setBuffer:X offset:0 atIndex:0];
   [encoder setBytes:(void*)&y length:sizeof(y) atIndex:1];
-  [encoder setBuffer:interm offset:0 atIndex:2];
+  [encoder setBuffer:output offset:0 atIndex:2];
   [encoder setBytes:(void*)&N length:sizeof(N) atIndex:3];
   [encoder setThreadgroupMemoryLength:tgroupmemSize atIndex:0];
   [encoder setComputePipelineState:kernel0];
   [encoder dispatchThreadgroups:threadgroups threadsPerThreadgroup:threadsPerThreadgroup];
-  
-  tgroupmemSize = threadgroupsWidth * sizeof(float);
-  tgroupmemSize = ((tgroupmemSize + 15) / 16) * 16;
-  [encoder setBuffer:interm offset:0 atIndex:0];
-  [encoder setBuffer:output offset:0 atIndex:1];
-  [encoder setBytes:(void*)&threadgroupsWidth length:sizeof(threadgroupsWidth) atIndex:2];
-  [encoder setThreadgroupMemoryLength:tgroupmemSize atIndex:0];
-  [encoder setComputePipelineState:kernel1];
-  [encoder dispatchThreads:MTLSizeMake(threadgroupsWidth, 1, 1) threadsPerThreadgroup:MTLSizeMake(threadgroupsWidth, 1, 1)];
   
   [encoder endEncoding];
 }
