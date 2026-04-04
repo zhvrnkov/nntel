@@ -205,7 +205,6 @@ struct Buffer {
   std::shared_ptr<float[]> sptr;
   
 };
-constexpr uint64_t alignment = 1;
 }
 
 
@@ -420,13 +419,20 @@ std::vector<std::unique_ptr<nn::layer::base>> buildModel(dims_t dims);
 }
 
 namespace cost {
-tensor::data_t quadratic(
-                         std::vector<std::unique_ptr<nn::layer::base>>& model,
-                         tensor::data_t& inputs,
-                         const tensor::data_t& outputs,
-                         tensor::data_t* backwardInput,
-                         tensor::device_type dev
-                         );
+  tensor::data_t quadratic( std::vector<std::unique_ptr<nn::layer::base>>& model,
+      tensor::data_t& inputs,
+      const tensor::data_t& outputs,
+      tensor::data_t* backwardInput,
+      tensor::device_type dev
+      );
+
+  tensor::data_t cross_entropy(
+      std::vector<std::unique_ptr<nn::layer::base>>& model,
+      tensor::data_t& inputs,
+      const tensor::data_t& outputs,
+      tensor::data_t* backwardInput,
+      tensor::device_type dev
+      );
 }
 
 namespace train {
@@ -439,7 +445,7 @@ struct data_loader {
     load();
   }
   
-  std::optional<std::pair<tensor::data_t, tensor::data_t>> nextBatch()
+  std::optional<std::pair<tensor::data_t, tensor::data_t>> nextBatch(tensor::device_type dev)
   {
     std::vector<float> output_vectors;
     std::vector<int64_t> output_vectors_dims = {0, 10};
@@ -456,8 +462,8 @@ struct data_loader {
     idx += count;
     
     auto output = std::make_pair(nn::tensor::data_t::concat(input_images), nn::tensor::data_t::copy(output_vectors_dims, output_vectors.data()));
-    output.first.transpose();
-    output.second.transpose();
+    output.first.transpose(dev);
+    output.second.transpose(dev);
     return output;
   }
   
@@ -1105,10 +1111,21 @@ tensor::data_t quadratic(
   nn::tensor::mul(diff, diff, diffSquared, dev);
   
   nn::tensor::sum(diffSquared, cost, -1, dev);
-  nn::tensor::div(cost, nn::tensor::data_t::value({(float)2 * outputs.dims[1]}), cost, tensor::device_type::cpu);
-  // nn::stream::global.gpuFlush();
+  nn::tensor::div(cost, nn::tensor::data_t::value({(float)2 * outputs.dims[1]}), cost, dev);
   
   return cost;
+}
+
+tensor::data_t cross_entropy(
+    std::vector<std::unique_ptr<nn::layer::base>>& model,
+    tensor::data_t& inputs,
+    const tensor::data_t& outputs,
+    tensor::data_t* backwardInput,
+    tensor::device_type dev
+    )
+{
+  const auto mo = nn::helpers::forward(model, inputs, dev); 
+  return {};
 }
 }
 
@@ -1117,7 +1134,11 @@ namespace nn::stream {
 
 inline void ctx_t::gpuFlush()
 {
+//  NSLog(@"gpuFlush %llu", gpu_pending_commands_count);
   gpu_pending_commands_count = 0;
+  [cmd addCompletedHandler:^(id<MTLCommandBuffer> cmd) {
+//    NSLog(@"%f\n", cmd.GPUEndTime - cmd.GPUStartTime);
+  }];
   [cmd commit];
   cmd = [gpu::queue commandBuffer];
 }
@@ -1169,7 +1190,7 @@ inline void ctx_t::gpu_dispatch(std::function<void()> block)
   block();
   [cmd encodeSignalEvent:event value:last_id + 1];
   last_id += 1;
-  if (gpu_pending_commands_count >= 20) {
+  if (gpu_pending_commands_count >= 128) {
     gpuFlush();
   }
 }
@@ -1848,7 +1869,7 @@ void axpby(id<MTLCommandBuffer> cmd, id<MTLBuffer> X, id<MTLBuffer> Y, id<MTLBuf
     [encoder setBytes:(void*)&A length:sizeof(A) atIndex:4];
     [encoder setComputePipelineState:kernel1];
   }
-  [encoder dispatchThreads:MTLSizeMake(N / 2, 1, 1) threadsPerThreadgroup:MTLSizeMake(32 * 2, 1, 1)];
+  [encoder dispatchThreads:MTLSizeMake((N + 1) / 2, 1, 1) threadsPerThreadgroup:MTLSizeMake(32 * 2, 1, 1)];
   
   [encoder endEncoding];
 }

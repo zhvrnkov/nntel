@@ -143,9 +143,9 @@ int main()
   auto train_loader = nn::train::data_loader{"/Users/vz/Developer/learn/informatics/ml/nntel/assets/mnist_png/training", 20, true};
   auto test_loader = nn::train::data_loader{"/Users/vz/Developer/learn/informatics/ml/nntel/assets/mnist_png/testing", -1, false};
 
-  auto model = nn::helpers::buildModel(std::vector<int64_t>{784, 100, 10});
+  auto model = nn::helpers::buildModel(std::vector<int64_t>{784, 128, 10});
 
-  auto testdata = test_loader.nextBatch();
+  auto testdata = test_loader.nextBatch(device);
   test_loader.reset();
   auto cost = nn::cost::quadratic(model, testdata->first, testdata->second, nullptr, device);
   nn::stream::global.synchronize();
@@ -155,7 +155,7 @@ int main()
     train_loader.reset();
     std::optional<std::pair<nn::tensor::data_t, nn::tensor::data_t>> batch;
     auto bi = nn::tensor::data_t::zero({1});
-    while ((batch = train_loader.nextBatch())) @autoreleasepool {
+    while ((batch = train_loader.nextBatch(device))) @autoreleasepool {
       // std::println("{} {}", nn::utils::xs2str(batch->first.dims), nn::utils::xs2str(batch->second.dims));
       auto cost = nn::cost::quadratic(model, batch->first, batch->second, &bi, device);
       for (int64_t i = model.size() - 1; i >= 0; i--) {
@@ -164,7 +164,6 @@ int main()
       for (int64_t i = model.size() - 1; i >= 0; i--) {
         model[i]->applyGrad(device);
       }
-      nn::stream::global.synchronize();
       // std::cout << "cost = " << *cost.data() << std::endl;
     }
     auto cost = nn::cost::quadratic(model, testdata->first, testdata->second, nullptr, device);
