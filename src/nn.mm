@@ -172,100 +172,6 @@ std::vector<int64_t> computeStrides(const std::vector<int64_t>& shape) {
   }
   return strides;
 }
-struct ndspan {
-  float* data;
-  std::vector<int64_t> shape;
-  std::vector<int64_t> strides;
-  
-  ndspan(float* data, std::vector<int64_t> shape)
-  : data(data)
-  , shape(shape)
-  , strides(computeStrides(shape))
-  {}
-
-  int64_t size() const {
-    return utils::area(shape) * sizeof(float);
-  }
-  
-  int64_t idx_dot(const std::vector<int64_t>& idxs) const {
-    int64_t idx = 0;
-    for (uint64_t i = 0; i < idxs.size(); i++) {
-      idx += idxs[i] * strides[i];
-    }
-    return idx;
-  }
-  
-  
-  float& operator[](std::vector<int64_t> idxs) {
-    assert(idxs.size() == strides.size());
-    return data[idx_dot(idxs)];
-  }
-  
-  std::span<float> row(std::vector<int64_t> idxs) {
-    assert((idxs.size() + 1) == strides.size());
-    return {data + idx_dot(idxs), (size_t)shape.back()};
-  }
-  
-  std::vector<int64_t> idxs(const std::vector<int64_t>& shape, int64_t flatIdx) const {
-    auto strides = computeStrides(shape);
-    std::vector<int64_t> output(shape.size());
-    int64_t remaining = flatIdx;
-    for (uint64_t i = 0; i < shape.size(); i++) {
-      output[i] = remaining / strides[i];
-      remaining %= strides[i];
-    }
-    return output;
-  }
-  
-  void rowsIter(std::vector<int64_t> shape, std::function<void(int64_t idx)> action) const {
-    uint idx = 0;
-    auto a = utils::area(shape);
-    
-    while (idx < a) {
-      auto rowIdx = idxs(shape, idx);
-      rowIdx.pop_back();
-      auto fidx = idx_dot(rowIdx);
-      for (auto i = 0; i < shape.back(); i++) action(fidx + i);
-      idx += shape.back();
-    }
-  }
-  
-  void zero_validate(const std::vector<int64_t>& logical_shape) const {
-    assert(logical_shape.size() == shape.size());
-    auto realTotal = utils::area(shape);
-    auto realLastDim = shape.back();
-    auto logicalLastDim = logical_shape.back();
-    
-    for (int64_t flat = 0; flat < realTotal; flat += realLastDim) {
-      auto ri = idxs(shape, flat);
-      bool rowInLogical = true;
-      for (uint64_t d = 0; d + 1 < ri.size(); d++) {
-        if (ri[d] >= logical_shape[d]) {
-          rowInLogical = false;
-          break;
-        }
-      }
-      
-      int64_t start = rowInLogical ? logicalLastDim : 0;
-      for (int64_t i = start; i < realLastDim; i++) {
-        assert(data[flat + i] == 0.0f && "padding is not zero");
-      }
-    }
-  }
-  
-  void spanIter(std::vector<int64_t> shape, std::function<void(int64_t idx, int64_t sz)> action) const {
-    uint idx = 0;
-    auto a = utils::area(shape);
-    
-    while (idx < a) {
-      auto rowIdx = idxs(shape, idx);
-      rowIdx.pop_back();
-      auto fidx = idx_dot(rowIdx);
-      action(fidx, this->shape.back());
-      idx += shape.back();
-    }
-  }
-};
 
 struct Buffer;
 template<typename shape_t>
@@ -273,38 +179,27 @@ Buffer aligned_alloc(shape_t shape);
 void free(Buffer buff);
 
 struct Buffer {
+  uint64_t size;
   float* data;
-  ndspan dspan;
   
-  Buffer(id<MTLBuffer> mtl, std::vector<int64_t> shape)
-  : data((float*)[mtl contents])
-  , dspan(ndspan{data, shape})
+  Buffer(id<MTLBuffer> mtl, uint64_t size)
+  : size(size)
+  , data((float*)[mtl contents])
   , mtl(mtl)
   {
   }
 
-  Buffer(std::shared_ptr<float[]> sptr, std::vector<int64_t> shape)
-  : data(sptr.get())
-  , dspan(ndspan{data, shape})
+  Buffer(std::shared_ptr<float[]> sptr, uint64_t size)
+  : size(size)
+  , data(sptr.get())
   , sptr(sptr)
   {
-  }
-
-  float& operator[](std::vector<int64_t> idxs) {
-    return dspan[idxs];
-  }
-  
-  std::span<float> row(std::vector<int64_t> idxs) {
-    return dspan.row(idxs);
   }
 
   id<MTLBuffer> buff() const {
     return mtl;
   }
   
-  uint64_t size() const {
-    return dspan.size();
-  }
   private:
   id<MTLBuffer> mtl;
   std::shared_ptr<float[]> sptr;
@@ -370,15 +265,7 @@ struct data_t {
   }
   
   int64_t size() const {
-    return utils::area(dims);
-  }
-  
-  int64_t rsize() const {
-    return utils::area(xs.dspan.shape);
-  }
-  
-  const std::vector<int64_t>& rshape() const {
-    return xs.dspan.shape;
+    return xs.size;
   }
   
   template<typename dims_t>
@@ -391,14 +278,6 @@ struct data_t {
   void transpose(device_type dev = device_type::cpu);
   
   data_t copy(tensor::device_type dev) const;
-  
-  void rowsIter(std::function<void(int64_t)> f) const {
-    xs.dspan.rowsIter(dims, f);
-  }
-  
-  void spanIter(std::function<void(int64_t, int64_t)> f) const {
-    xs.dspan.spanIter(dims, f);
-  }
 };
 
 void matmul(const data_t& A, const data_t& B, data_t& C, device_type dev=device_type::cpu);
@@ -478,7 +357,7 @@ struct linear : public base {
     if (dbiases.has_value() == false) {
       dbiases = tensor::data_t({biases.dims[0]});
     }
-//    memset(dbiases->data(), 0, dbiases->rsize() * sizeof(float));
+//    memset(dbiases->data(), 0, dbiases->size() * sizeof(float));
     
     (*(this->input)).transpose(dev);
     
@@ -710,23 +589,8 @@ namespace nn::tensor {
 std::mt19937 gen{};
 
 void copy(allocator::Buffer dst, float* src, const std::vector<int64_t>& shape) {
-  assert(shape.size() == dst.dspan.shape.size());
-  
-  auto srcSpan = allocator::ndspan(src, shape);
-  
-  auto rowSize = shape.back();
-  uint idx = 0;
-  auto a = utils::area(shape);
-  while (idx < a) {
-    auto rowIdx = srcSpan.idxs(shape, idx);
-    rowIdx.pop_back();
-    auto drow = dst.row(rowIdx);
-    auto srow = srcSpan.row(rowIdx);
-    for (auto i = 0; i < rowSize; i++) {
-      drow[i] = srow[i];
-    }
-    idx += rowSize;
-  }
+  assert(utils::area(shape) == (int64_t)dst.size);
+  memcpy(dst.data, src, dst.size * sizeof(float));
 }
 
 data_t data_t::value(std::initializer_list<float> list)
@@ -760,7 +624,7 @@ data_t data_t::zero(std::initializer_list<int64_t> dims) {
   auto storage = allocator::aligned_alloc(dims);
   
   data_t out{dims, storage};
-  memset(out.data(), 0, utils::area(storage.dspan.shape) * sizeof(float));
+  memset(out.data(), 0, storage.size * sizeof(float));
   return out;
 }
 
@@ -769,7 +633,7 @@ data_t data_t::zero(dims_t dims) {
   auto storage = allocator::aligned_alloc(dims);
   
   data_t out{dims, storage};
-  memset(out.data(), 0, utils::area(storage.dspan.shape) * sizeof(float));
+  memset(out.data(), 0, storage.size * sizeof(float));
   return out;
 }
 
@@ -777,7 +641,7 @@ data_t data_t::fill(std::initializer_list<int64_t> dims, float x) {
   auto storage = allocator::aligned_alloc(dims);
   
   // Zero the entire buffer first (including padding)
-  memset(storage.data, 0, utils::area(storage.dspan.shape) * sizeof(float));
+  memset(storage.data, 0, storage.size * sizeof(float));
   
   // Fill only the logical shape
   auto area = utils::area(dims);
@@ -792,7 +656,7 @@ data_t data_t::random(std::initializer_list<int64_t> dims, float stddev) {
   auto storage = allocator::aligned_alloc(dims);
   
   // Zero the entire buffer first (including padding)
-  memset(storage.data, 0, utils::area(storage.dspan.shape) * sizeof(float));
+  memset(storage.data, 0, storage.size * sizeof(float));
   
   std::normal_distribution<float> dstr(0.0, stddev);
   
@@ -821,11 +685,11 @@ data_t data_t::concat(const tensors& xs) {
   auto storage = allocator::aligned_alloc(dims);
   
   // Zero the entire buffer first (including padding)
-  memset(storage.data, 0, utils::area(storage.dspan.shape) * sizeof(float));
+  memset(storage.data, 0, storage.size * sizeof(float));
   
   uint64_t i = 0;
   for (auto& x : xs) {
-    memcpy(storage.data + x.rsize() * i, x.data(), x.rsize() * sizeof(float));
+    memcpy(storage.data + x.size() * i, x.data(), x.size() * sizeof(float));
     i += 1;
   }
   
@@ -842,7 +706,7 @@ void matmul(const data_t& A, const data_t& B, data_t& C, device_type dev)
     assert(B.dims[1] == C.dims[1]);
     if (dev == device_type::cpu) {
       nn::stream::global.cpu_dispatch([=] {
-        nn::cpu::gemm(A.data(), B.data(), C.data(), C.rshape()[0], A.rshape()[1], C.rshape()[1]);
+        nn::cpu::gemm(A.data(), B.data(), C.data(), C.dims[0], A.dims[1], C.dims[1]);
       });
     } else if (dev == device_type::accelerate) {
       nn::stream::global.cpu_dispatch([=] {
@@ -850,7 +714,7 @@ void matmul(const data_t& A, const data_t& B, data_t& C, device_type dev)
       });
     } else if (dev == device_type::gpu) {
       nn::stream::global.gpu_dispatch([=] {
-        nn::gpu::gemm(stream::global.cmd, A.buff(), B.buff(), C.buff(), C.rshape()[0], A.rshape()[1], C.rshape()[1]);
+        nn::gpu::gemm(stream::global.cmd, A.buff(), B.buff(), C.buff(), C.dims[0], A.dims[1], C.dims[1]);
       });
     }
   } else if (A.dims.size() == 1 && B.dims.size() == 1) {
@@ -859,7 +723,7 @@ void matmul(const data_t& A, const data_t& B, data_t& C, device_type dev)
     assert(1 == C.dims[0]);
     if (dev == device_type::cpu) {
       nn::stream::global.cpu_dispatch([=] {
-        nn::cpu::dot(A.data(), B.data(), C.data(), A.rsize());
+        nn::cpu::dot(A.data(), B.data(), C.data(), A.size());
       });
     } else if (dev == device_type::accelerate) {
       nn::stream::global.cpu_dispatch([=] {
@@ -876,7 +740,7 @@ void matmul(const data_t& A, const data_t& B, data_t& C, device_type dev)
     assert(B.dims[0] == A.dims[1]);
     if (dev == device_type::cpu) {
       nn::stream::global.cpu_dispatch([=] {
-        nn::cpu::gemv(A.data(), B.data(), C.data(), A.rshape()[0], A.rshape()[1]);
+        nn::cpu::gemv(A.data(), B.data(), C.data(), A.dims[0], A.dims[1]);
       });
     } else if (dev == device_type::accelerate) {
       nn::stream::global.cpu_dispatch([=] {
@@ -884,7 +748,7 @@ void matmul(const data_t& A, const data_t& B, data_t& C, device_type dev)
       });
     } else if (dev == device_type::gpu) {
       nn::stream::global.gpu_dispatch([=] {
-        nn::gpu::gemv(stream::global.cmd, A.buff(), B.buff(), C.buff(), A.rshape()[0], A.rshape()[1]);
+        nn::gpu::gemv(stream::global.cmd, A.buff(), B.buff(), C.buff(), A.dims[0], A.dims[1]);
       });
     }
   } else {
@@ -899,7 +763,7 @@ void add(const data_t& A, const data_t& B, data_t& C, float a, float b, device_t
     if (dev == device_type::cpu || dev == device_type::accelerate) {
       auto axpbyFn = dev == device_type::accelerate ? nn::accelerate::axpby : nn::cpu::axpby;
       nn::stream::global.cpu_dispatch([=] {
-        axpbyFn(A.data(), B.data(), C.data(), A.rsize(), a, b, 0.0);
+        axpbyFn(A.data(), B.data(), C.data(), A.size(), a, b, 0.0);
       });
     } else if (dev == device_type::gpu) {
       nn::stream::global.gpu_dispatch([=] {
@@ -912,7 +776,7 @@ void add(const data_t& A, const data_t& B, data_t& C, float a, float b, device_t
       if (dev == device_type::cpu || dev == device_type::accelerate) {
         auto axpbyFn = dev == device_type::accelerate ? nn::accelerate::axpby : nn::cpu::axpby;
         nn::stream::global.cpu_dispatch([=] {
-          axpbyFn(A.data(), A.data(), C.data(), A.rsize(), a, 0.0, *B.data() * b);
+          axpbyFn(A.data(), A.data(), C.data(), A.size(), a, 0.0, *B.data() * b);
         });
       } else if (dev == device_type::gpu) {
         nn::stream::global.gpu_dispatch([=] {
@@ -925,7 +789,7 @@ void add(const data_t& A, const data_t& B, data_t& C, float a, float b, device_t
       if (dev == device_type::cpu || dev == device_type::accelerate) {
         auto axpby2dBcolFn = dev == device_type::accelerate ? nn::accelerate::axpby2dBcol : nn::cpu::axpby2dBcol;
         nn::stream::global.cpu_dispatch([=] {
-          axpby2dBcolFn(A.data(), B.data(), C.data(), A.rsize(), B.rsize(), a, b, 0.0f);
+          axpby2dBcolFn(A.data(), B.data(), C.data(), A.size(), B.size(), a, b, 0.0f);
         });
       } else if (dev == device_type::gpu) {
         nn::stream::global.gpu_dispatch([=] {
@@ -939,7 +803,7 @@ void add(const data_t& A, const data_t& B, data_t& C, float a, float b, device_t
     if (dev == device_type::cpu || dev == device_type::accelerate) {
       auto axpbyFn = dev == device_type::accelerate ? nn::accelerate::axpby : nn::cpu::axpby;
       nn::stream::global.cpu_dispatch([=] {
-        axpbyFn(B.data(), B.data(), C.data(), C.rsize(), 0.0, b, *A.data() * a);
+        axpbyFn(B.data(), B.data(), C.data(), C.size(), 0.0, b, *A.data() * a);
       });
     } else if (dev == device_type::gpu) {
       nn::stream::global.gpu_dispatch([=] {
@@ -964,7 +828,7 @@ void mul(const data_t& A, const data_t& B, data_t& C, device_type dev)
     if (dev == device_type::cpu || dev == device_type::accelerate) {
       auto axpbyFn = dev == device_type::accelerate ? nn::accelerate::axpby : nn::cpu::axpby;
       nn::stream::global.cpu_dispatch([=] {
-        axpbyFn(A.data(), A.data(), C.data(), A.rsize(), B.data()[0], 0.0, 0.0);
+        axpbyFn(A.data(), A.data(), C.data(), A.size(), B.data()[0], 0.0, 0.0);
       });
     } else if (dev == device_type::gpu) {
       nn::stream::global.gpu_dispatch([=] {
@@ -980,7 +844,7 @@ void mul(const data_t& A, const data_t& B, data_t& C, device_type dev)
     if (dev == device_type::cpu || dev == device_type::accelerate) {
       auto addcmulFn = dev == device_type::accelerate ? nn::accelerate::addcmul : nn::cpu::addcmul;
       nn::stream::global.cpu_dispatch([=] {
-        addcmulFn(A.data(), B.data(), C.data(), A.rsize(), 1.0, 0.0);
+        addcmulFn(A.data(), B.data(), C.data(), A.size(), 1.0, 0.0);
       });
     } else if (dev == device_type::gpu) {
       nn::stream::global.gpu_dispatch([=] {
@@ -1000,7 +864,7 @@ void div(const data_t& A, const data_t& B, data_t& C, device_type dev)
     if (dev == device_type::cpu || dev == device_type::accelerate) {
       auto axpbyFn = dev == device_type::accelerate ? nn::accelerate::axpby : nn::cpu::axpby;
       nn::stream::global.cpu_dispatch([=] {
-        axpbyFn(A.data(), A.data(), C.data(), A.rsize(), 1.0f / B.data()[0], 0.0, 0.0);
+        axpbyFn(A.data(), A.data(), C.data(), A.size(), 1.0f / B.data()[0], 0.0, 0.0);
       });
     } else if (dev == device_type::gpu) {
       nn::stream::global.gpu_dispatch([=] {
@@ -1014,7 +878,7 @@ void div(const data_t& A, const data_t& B, data_t& C, device_type dev)
     if (dev == device_type::cpu || dev == device_type::accelerate) {
       auto addcdivFn = dev == device_type::accelerate ? nn::accelerate::addcdiv : nn::cpu::addcdiv;
       nn::stream::global.cpu_dispatch([=] {
-        addcdivFn(A.data(), B.data(), C.data(), A.rsize(), 1.0, 0.0);
+        addcdivFn(A.data(), B.data(), C.data(), A.size(), 1.0, 0.0);
       });
     } else if (dev == device_type::gpu) {
       nn::stream::global.gpu_dispatch([=] {
@@ -1032,7 +896,7 @@ void sigmoid(const data_t& A, data_t& C, device_type dev)
   if (dev == device_type::cpu || dev == device_type::accelerate) {
     auto sigmoidFn = dev == device_type::accelerate ? nn::accelerate::sigmoid : nn::cpu::sigmoid;
     nn::stream::global.cpu_dispatch([=] {
-      sigmoidFn(A.data(), C.data(), A.rsize());
+      sigmoidFn(A.data(), C.data(), A.size());
     });
   } else if (dev == device_type::gpu) {
     nn::stream::global.gpu_dispatch([=] {
@@ -1047,7 +911,7 @@ void sigmoidDerivative(const data_t& A, data_t& C, device_type dev)
   if (dev == device_type::cpu || dev == device_type::accelerate) {
     auto sigmoidDerivFn = dev == device_type::accelerate ? nn::accelerate::sigmoidDerivative : nn::cpu::sigmoidDerivative;
     nn::stream::global.cpu_dispatch([=] {
-      sigmoidDerivFn(A.data(), C.data(), A.rsize());
+      sigmoidDerivFn(A.data(), C.data(), A.size());
     });
   } else if (dev == device_type::gpu) {
     nn::stream::global.gpu_dispatch([=] {
@@ -1064,7 +928,7 @@ void sum(const data_t& A, data_t& C, int64_t dim, device_type dev)
     if (dev == device_type::cpu || dev == device_type::accelerate) {
       auto sumFn = dev == device_type::accelerate ? nn::accelerate::sum : nn::cpu::sum;
       nn::stream::global.cpu_dispatch([=] {
-        sumFn(A.data(), C.data(), A.rsize());
+        sumFn(A.data(), C.data(), A.size());
       });
     } else if (dev == device_type::gpu) {
       nn::stream::global.gpu_dispatch([=] {
@@ -1079,13 +943,13 @@ void sum(const data_t& A, data_t& C, int64_t dim, device_type dev)
       if (dev == device_type::cpu || dev == device_type::accelerate) {
         auto sumDim0Fn = dev == device_type::accelerate ? nn::accelerate::sum_dim0 : nn::cpu::sum_dim0;
         nn::stream::global.cpu_dispatch([=] {
-          sumDim0Fn(A.data(), C.data(), A.dims[0], A.dims[1], A.rshape()[1]);
+          sumDim0Fn(A.data(), C.data(), A.dims[0], A.dims[1], A.dims[1]);
         });
       } else if (dev == device_type::gpu) {
         nn::stream::global.gpu_dispatch([=] {
           nn::gpu::sum_dim0(stream::global.cmd, A.buff(), C.buff(),
                             (uint32_t)A.dims[0], (uint32_t)A.dims[1],
-                            (uint32_t)A.rshape()[1]);
+                            (uint32_t)A.dims[1]);
         });
       }
     } else if (dim == 1) {
@@ -1093,13 +957,13 @@ void sum(const data_t& A, data_t& C, int64_t dim, device_type dev)
       if (dev == device_type::cpu || dev == device_type::accelerate) {
         auto sumDim1Fn = dev == device_type::accelerate ? nn::accelerate::sum_dim1 : nn::cpu::sum_dim1;
         nn::stream::global.cpu_dispatch([=] {
-          sumDim1Fn(A.data(), C.data(), A.dims[0], A.dims[1], A.rshape()[1]);
+          sumDim1Fn(A.data(), C.data(), A.dims[0], A.dims[1], A.dims[1]);
         });
       } else if (dev == device_type::gpu) {
         nn::stream::global.gpu_dispatch([=] {
           nn::gpu::sum_dim1(stream::global.cmd, A.buff(), C.buff(),
                             (uint32_t)A.dims[0], (uint32_t)A.dims[1],
-                            (uint32_t)A.rshape()[1]);
+                            (uint32_t)A.dims[1]);
         });
       }
     } else {
@@ -1114,19 +978,19 @@ void transpose(const data_t& A, data_t& C, device_type dev)
   assert(A.dims.size() == C.dims.size());
   assert(A.dims[0] == C.dims[1]);
   assert(A.dims[1] == C.dims[0]);
-  auto rshape = A.rshape();
+  auto shape = A.dims;
   if (dev == device_type::cpu) {
     nn::stream::global.cpu_dispatch([=]() {
-      nn::cpu::transpose<1>(A.xs.data, C.xs.data, rshape[0], rshape[1]);
+      nn::cpu::transpose<1>(A.xs.data, C.xs.data, shape[0], shape[1]);
     });
   } else if (dev == device_type::accelerate) {
     nn::stream::global.cpu_dispatch([=]() {
-      nn::accelerate::transpose(A.xs.data, C.xs.data, rshape[0], rshape[1]);
+      nn::accelerate::transpose(A.xs.data, C.xs.data, shape[0], shape[1]);
     });
   } else if (dev == device_type::gpu) {
     nn::stream::global.gpu_dispatch([=]() {
       nn::gpu::transpose(stream::global.cmd, A.buff(), C.buff(),
-                         (uint32_t)rshape[0], (uint32_t)rshape[1]);
+                         (uint32_t)shape[0], (uint32_t)shape[1]);
     });
   }
 
@@ -1151,13 +1015,7 @@ void data_t::flatten() {
     return;
   }
   auto newDims = std::vector<int64_t>{size()};
-  auto newStorage = allocator::aligned_alloc(newDims);
-  int64_t destIdx = 0;
-  rowsIter([&](int64_t srcIdx) {
-    newStorage.data[destIdx++] = xs.data[srcIdx];
-  });
   this->dims = newDims;
-  this->xs = newStorage;
 }
 
 data_t data_t::copy(tensor::device_type dev) const {
@@ -1166,12 +1024,12 @@ data_t data_t::copy(tensor::device_type dev) const {
   auto srcBuffer = xs;
   if (dev == tensor::device_type::cpu || dev == tensor::device_type::accelerate) {
     nn::stream::global.cpu_dispatch([=]() {
-      memcpy(storage.data, srcBuffer.data, storage.size());
+      memcpy(storage.data, srcBuffer.data, storage.size);
     });
   } else {
     nn::stream::global.gpu_dispatch([=]() {
       id<MTLBlitCommandEncoder> blit = [nn::stream::global.cmd blitCommandEncoder];
-      [blit copyFromBuffer:srcBuffer.buff() sourceOffset:0 toBuffer:storage.buff() destinationOffset:0 size:storage.size()];
+      [blit copyFromBuffer:srcBuffer.buff() sourceOffset:0 toBuffer:storage.buff() destinationOffset:0 size:storage.size];
       [blit endEncoding];
     });
   }
@@ -1207,19 +1065,14 @@ namespace nn::allocator {
 template<typename shape_t>
 Buffer aligned_alloc(shape_t shape)
 {
-  std::vector<int64_t> realShape = shape;
-  for (auto& s : realShape) {
-    s = alignment * ((s + (alignment - 1)) / alignment);
-  }
-  
-  auto area = utils::area(realShape);
+  auto area = utils::area(shape);
   if (true) {
     auto mtlBuff = [gpu::device newBufferWithLength:area * sizeof(float) options:MTLResourceStorageModeShared];
     memset(mtlBuff.contents, 0, area * sizeof(float));
-    return Buffer { mtlBuff, realShape };
+    return Buffer { mtlBuff, (uint64_t)area };
   } else {
     std::shared_ptr<float[]> sptr{new float[area]{0.0f}};
-    return Buffer { sptr, realShape };
+    return Buffer { sptr, (uint64_t)area };
   }
 }
 
