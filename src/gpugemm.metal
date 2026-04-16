@@ -753,32 +753,6 @@ kernel void sum(
   }
 }
 
-kernel void sigmoid(
-                    const device float* X,
-                    device float* output,
-                    constant const uint& N,
-                    uint gid [[thread_position_in_grid]],
-                    uint threads [[threads_per_grid]]
-                    )
-{
-    for (uint i = gid; i < N; i += threads) {
-        output[i] = 1.0 / (1.0 + exp(-X[i]));
-    }
-}
-
-kernel void sigmoidDerivative(
-                    const device float* X,
-                    device float* output,
-                    constant const uint& N,
-                    uint gid [[thread_position_in_grid]],
-                    uint threads [[threads_per_grid]]
-                    )
-{
-    for (uint i = gid; i < N; i += threads) {
-        float s = 1.0 / (1.0 + exp(-X[i]));
-        output[i] = s * (1.0 - s);
-    }
-}
 kernel void axpby2(
                   const device float* X, const device float* Y, device float* out,
                   constant const uint& N,

@@ -147,7 +147,8 @@ int main()
 
   auto testdata = test_loader.nextBatch(device);
   test_loader.reset();
-  auto cost = nn::cost::quadratic(model, testdata->first, testdata->second, nullptr, device);
+  auto cost_f = nn::cost::cross_entropy(model, device);
+  auto cost = cost_f.eval(testdata->first, testdata->second);
   nn::stream::global.synchronize();
   std::cout << "initial cost = " << *cost.data() << std::endl;
 
@@ -156,17 +157,9 @@ int main()
     std::optional<std::pair<nn::tensor::data_t, nn::tensor::data_t>> batch;
     auto bi = nn::tensor::data_t::zero({1});
     while ((batch = train_loader.nextBatch(device))) @autoreleasepool {
-      // std::println("{} {}", nn::utils::xs2str(batch->first.dims), nn::utils::xs2str(batch->second.dims));
-      auto cost = nn::cost::quadratic(model, batch->first, batch->second, &bi, device);
-      for (int64_t i = model.size() - 1; i >= 0; i--) {
-        bi = model[i]->backward(bi, device);
-      }
-      for (int64_t i = model.size() - 1; i >= 0; i--) {
-        model[i]->applyGrad(device);
-      }
-      // std::cout << "cost = " << *cost.data() << std::endl;
+      cost_f.step(batch->first, batch->second, 0.5);
     }
-    auto cost = nn::cost::quadratic(model, testdata->first, testdata->second, nullptr, device);
+    auto cost = cost_f.eval(testdata->first, testdata->second);
     nn::stream::global.synchronize();
     std::cout << "cost = " << *cost.data() << std::endl;
   }

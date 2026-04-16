@@ -39,6 +39,7 @@ void dot(id<MTLCommandBuffer> cmd, id<MTLBuffer> X, id<MTLBuffer> Y, id<MTLBuffe
 void sum(id<MTLCommandBuffer> cmd, id<MTLBuffer> X, float y, id<MTLBuffer> output);
 void sigmoid(id<MTLCommandBuffer> cmd, id<MTLBuffer> X, id<MTLBuffer> output);
 void sigmoidDerivative(id<MTLCommandBuffer> cmd, id<MTLBuffer> X, id<MTLBuffer> output);
+void crossEntropy(id<MTLCommandBuffer> cmd, id<MTLBuffer> X, id<MTLBuffer> Y, id<MTLBuffer> output);
 void axpby(id<MTLCommandBuffer> cmd, id<MTLBuffer> X, id<MTLBuffer> Y, id<MTLBuffer> output, float fX, float fY, float A);
 void axpby2dBcol(id<MTLCommandBuffer> cmd, id<MTLBuffer> X, id<MTLBuffer> Y, id<MTLBuffer> output, float fX, float fY, float A);
 void sum_dim0(id<MTLCommandBuffer> cmd, id<MTLBuffer> X, id<MTLBuffer> out, uint32_t Nrows, uint32_t Ncols, uint32_t stride);
@@ -51,6 +52,7 @@ void axpy(id<MTLCommandBuffer> cmd, id<MTLBuffer> X, id<MTLBuffer> Y, id<MTLBuff
 auto device = MTLCreateSystemDefaultDevice();
 auto queue = [device newCommandQueue];
 auto lib = [device newDefaultLibrary];
+auto scope = [[MTLCaptureManager sharedCaptureManager] newCaptureScopeWithCommandQueue:queue];
 
 namespace compute {
 inline void dispatch1d(id<MTLComputeCommandEncoder> encoder,
@@ -277,6 +279,23 @@ struct data_t {
   void transpose(device_type dev = device_type::cpu);
   
   data_t copy(tensor::device_type dev) const;
+  
+  std::string description() const {
+    return std::format("shape = {} | data = {}", utils::xs2str(dims), utils::xs2str(std::span<float>(data(), size())));
+  }
+  
+  uint64_t hash() const {
+    uint64_t hash = 0;
+    std::hash<float> fhash;
+    std::hash<int64_t> ihash;
+    for (auto i = 0; i < size(); i++) {
+      hash ^= fhash(data()[i]);
+    }
+    for (auto i : dims) {
+      hash ^= ihash(i);
+    }
+    return hash;
+  }
 };
 
 void matmul(const data_t& A, const data_t& B, data_t& C, device_type dev=device_type::cpu);
@@ -295,7 +314,7 @@ namespace layer {
 struct base {
 virtual tensor::data_t forward(const tensor::data_t& input, tensor::device_type dev) = 0;
 virtual tensor::data_t backward(const tensor::data_t& input, tensor::device_type dev) = 0;
-virtual void applyGrad(tensor::device_type) {}
+virtual void applyGrad(tensor::device_type, float lr) {}
 virtual ~base() = default;
 };
 
@@ -356,7 +375,8 @@ struct linear : public base {
     if (dbiases.has_value() == false) {
       dbiases = tensor::data_t({biases.dims[0]});
     }
-//    memset(dbiases->data(), 0, dbiases->size() * sizeof(float));
+    // TODO: zero dbiases cause sum is accumulative
+    // memset(dbiases->data(), 0, dbiases->size() * sizeof(float));
     
     (*(this->input)).transpose(dev);
     
@@ -365,11 +385,11 @@ struct linear : public base {
     
     return output;
   }
-  
-  void applyGrad(tensor::device_type dev) override
+
+  void applyGrad(tensor::device_type dev, float lr) override
   {
-    tensor::add(weights, *dweights, weights, 1.0, -1.0 / (2.0 * zs.dims[1]), dev);
-    tensor::add(biases, *dbiases, biases, 1.0, -1.0 / (2.0 * zs.dims[1]), dev);
+    tensor::add(weights, *dweights, weights, 1.0, -lr / zs.dims[1], dev);
+    tensor::add(biases, *dbiases, biases, 1.0, -lr / zs.dims[1], dev);
   }
 };
 
@@ -416,23 +436,6 @@ const tensor::data_t forward(std::vector<nn::layer::linear>& model, const tensor
 
 template<typename dims_t>
 std::vector<std::unique_ptr<nn::layer::base>> buildModel(dims_t dims);
-}
-
-namespace cost {
-  tensor::data_t quadratic( std::vector<std::unique_ptr<nn::layer::base>>& model,
-      tensor::data_t& inputs,
-      const tensor::data_t& outputs,
-      tensor::data_t* backwardInput,
-      tensor::device_type dev
-      );
-
-  tensor::data_t cross_entropy(
-      std::vector<std::unique_ptr<nn::layer::base>>& model,
-      tensor::data_t& inputs,
-      const tensor::data_t& outputs,
-      tensor::data_t* backwardInput,
-      tensor::device_type dev
-      );
 }
 
 namespace train {
@@ -926,6 +929,17 @@ void sigmoidDerivative(const data_t& A, data_t& C, device_type dev)
   }
 }
 
+void crossEntropy(const data_t& A, const data_t& B, data_t& C, device_type dev)
+{
+  if (dev == device_type::cpu || dev == device_type::accelerate) {
+    assert(false && "not implemented");
+  } else if (dev == device_type::gpu) {
+    nn::stream::global.gpu_dispatch([=] {
+      nn::gpu::crossEntropy(nn::stream::global.cmd, A.buff(), B.buff(), C.buff());
+    });
+  }
+}
+
 void sum(const data_t& A, data_t& C, int64_t dim, device_type dev)
 {
   if (dim == -1) {
@@ -1044,7 +1058,7 @@ data_t data_t::copy(tensor::device_type dev) const {
 }
 
 namespace nn::helpers {
-const tensor::data_t forward(std::vector<std::unique_ptr<nn::layer::base>>& model, tensor::data_t& input, tensor::device_type dev)
+const tensor::data_t forward(std::vector<std::unique_ptr<nn::layer::base>>& model, const tensor::data_t& input, tensor::device_type dev)
 {
   auto output = input;
   for (auto& l : model) {
@@ -1088,45 +1102,96 @@ void free(Buffer buff)
 }
 }
 
-namespace nn::cost {
-tensor::data_t quadratic(
-                         std::vector<std::unique_ptr<nn::layer::base>>& model,
-                         tensor::data_t& inputs,
-                         const tensor::data_t& outputs,
-                         tensor::data_t* backwardInput,
-                         tensor::device_type dev
-                         )
-{
-  const auto modelOutput = nn::helpers::forward(model, inputs, dev);
-  
-  auto diff = nn::tensor::data_t::zero(modelOutput.dims);
-  auto cost = nn::tensor::data_t::value({0.0});
-  auto diffSquared = diff;
-  
-  nn::tensor::sub(modelOutput, outputs, diff, dev);
-  if (backwardInput) {
-    *backwardInput = diff;
-    diffSquared = nn::tensor::data_t{diffSquared.dims};
-  }
-  nn::tensor::mul(diff, diff, diffSquared, dev);
-  
-  nn::tensor::sum(diffSquared, cost, -1, dev);
-  nn::tensor::div(cost, nn::tensor::data_t::value({(float)2 * outputs.dims[1]}), cost, dev);
-  
-  return cost;
+namespace nn {
+using model_t = std::vector<std::unique_ptr<nn::layer::base>>;
 }
 
-tensor::data_t cross_entropy(
-    std::vector<std::unique_ptr<nn::layer::base>>& model,
-    tensor::data_t& inputs,
-    const tensor::data_t& outputs,
-    tensor::data_t* backwardInput,
-    tensor::device_type dev
-    )
-{
-  const auto mo = nn::helpers::forward(model, inputs, dev); 
-  return {};
-}
+namespace nn::cost {
+struct base {
+  base(model_t& model, tensor::device_type device) : model(model), dev(device) {}
+  virtual ~base() = default;
+  virtual void step(const tensor::data_t& input, const tensor::data_t& target, float lr) = 0;
+  virtual tensor::data_t eval(const tensor::data_t& inputs, const tensor::data_t& target) = 0;
+  
+  model_t& model;
+  tensor::device_type dev;
+  
+protected:
+  std::optional<tensor::data_t> backwardInput;
+};
+
+struct quadratic : public base {
+  using base::base;
+  
+  tensor::data_t eval(const tensor::data_t& inputs, const tensor::data_t& target) override {
+    const auto modelOutput = nn::helpers::forward(model, inputs, dev);
+    
+    auto diff = nn::tensor::data_t::zero(modelOutput.dims);
+    auto cost = nn::tensor::data_t::value({0.0});
+    auto diffSquared = diff;
+    
+    nn::tensor::sub(modelOutput, target, diff, dev);
+    if (backwardInput.has_value()) {
+      *backwardInput = diff;
+      diffSquared = nn::tensor::data_t{diffSquared.dims};
+    }
+    nn::tensor::mul(diff, diff, diffSquared, dev);
+    
+    nn::tensor::sum(diffSquared, cost, -1, dev);
+    nn::tensor::div(cost, nn::tensor::data_t::value({(float)2 * target.dims[1]}), cost, dev);
+    
+    return cost;
+  }
+  
+  void step(const tensor::data_t& input, const tensor::data_t& target, float lr) override {
+    backwardInput = nn::tensor::data_t::zero({1});
+    auto cost = eval(input, target);
+    
+    for (int64_t i = model.size() - 1; i >= 0; i--) {
+      backwardInput = model[i]->backward(backwardInput.value(), dev);
+    }
+    for (int64_t i = model.size() - 1; i >= 0; i--) {
+      model[i]->applyGrad(dev, lr);
+    }
+    backwardInput = std::nullopt;
+  }
+};
+
+struct cross_entropy : public base {
+  using base::base;
+
+  tensor::data_t eval(const tensor::data_t &inputs, const tensor::data_t &outputs) override {
+    const auto mo = nn::helpers::forward(model, inputs, dev);
+    auto cross = nn::tensor::data_t(mo.dims);
+    auto cost = nn::tensor::data_t::value({0.0});
+    if (backwardInput) {
+      *backwardInput = nn::tensor::data_t::zero(mo.dims);
+      nn::tensor::sub(mo, outputs, *backwardInput, dev);
+    }
+
+    nn::tensor::crossEntropy(outputs, mo, cross, dev);
+    nn::tensor::sum(cross, cost, -1, dev);
+    nn::tensor::div(cost, nn::tensor::data_t::value({(float)outputs.dims[1]}), cost, dev);
+    return cost;
+  }
+  
+  void step(const tensor::data_t &input, const tensor::data_t &target, float lr) override {
+    backwardInput = nn::tensor::data_t::zero({1});
+    auto cost = eval(input, target);
+    
+    // TODO: this is hotfix and should be optimized my graph optimizer
+    // graph optimizer will see that dc/da = x/sigmoidDeriv, and dc/dz = dc/dz * sigmoidDeriv
+    // and should strip the part
+    auto start_idx = dynamic_cast<nn::layer::sigmoid*>(model.back().get()) ? model.size() - 2 : model.size() - 1;
+    for (int64_t i = start_idx; i >= 0; i--) {
+      backwardInput = model[i]->backward(backwardInput.value(), dev);
+    }
+    for (int64_t i = model.size() - 1; i >= 0; i--) {
+      model[i]->applyGrad(dev, lr);
+    }
+    backwardInput = std::nullopt;
+  }
+};
 }
 
 namespace nn::stream {
@@ -1785,15 +1850,87 @@ void sum(id<MTLCommandBuffer> cmd, id<MTLBuffer> X, float y, id<MTLBuffer> outpu
   [encoder endEncoding];
 }
 
-void sigmoid(id<MTLCommandBuffer> cmd, id<MTLBuffer> X, id<MTLBuffer> output)
+enum class jit_op {
+  unary,
+  binary
+};
+
+std::string render_kernel(jit_op op, const std::string& name, const std::string& body)
 {
-  static id<MTLComputePipelineState> kernel;
+  std::string templ;
+  switch (op) {
+    case jit_op::unary: {
+      templ = R"(
+    #include <metal_stdlib>
+    using namespace metal;
+    
+    kernel void {}(
+      const device float* X,
+      device float* output,
+      constant const uint& N,
+      uint gid [[thread_position_in_grid]],
+      uint threads [[threads_per_grid]]
+    ) {{
+      for (uint i = gid; i < N; i += threads) {{
+        {}
+      }}
+    }}
+    )";
+      break;
+    case jit_op::binary: {
+      templ = R"(
+    #include <metal_stdlib>
+    using namespace metal;
+    
+    kernel void {}(
+      const device float* X, const device float* Y,
+      device float* output,
+      constant const uint& N,
+      uint gid [[thread_position_in_grid]],
+      uint threads [[threads_per_grid]]
+    ) {{
+      for (uint i = gid; i < N; i += threads) {{
+        {}
+      }}
+    }}
+    )";
+      break;
+    }
+    }
+  }
+  return std::vformat(templ, std::make_format_args(name, body));
+}
+
+id<MTLComputePipelineState> jit_kernel(jit_op op, std::string name, std::string body)
+{
+  static NSMutableDictionary* kernels;
   static dispatch_once_t onceToken;
   dispatch_once(&onceToken, ^{
-    auto kernelFunc = [gpu::lib newFunctionWithName:@"sigmoid"];
-    kernel = [gpu::device newComputePipelineStateWithFunction:kernelFunc error:nil];
+      kernels = [[NSMutableDictionary alloc] init];
   });
-  if (!kernel) { NSLog(@"got error during pipeline creation"); return; }
+
+  NSString* name_op = [NSString stringWithCString:(name + body).c_str() encoding:NSUTF8StringEncoding];
+  id<MTLComputePipelineState> kernel = [kernels valueForKey:name_op];
+  if (kernel == nil) {
+    auto source = render_kernel(op, name, body);
+    
+    NSError* err = nil;
+    auto lib = [gpu::device newLibraryWithSource:@(source.c_str()) options:nil error:&err];
+    
+    assert(lib != nil && err == nil);
+    auto kernelFunc = [lib newFunctionWithName:@(name.c_str())];
+    auto newkernel = [gpu::device newComputePipelineStateWithFunction:kernelFunc error:nil];
+
+    [kernels setValue:newkernel forKey:name_op];
+    kernel = newkernel;
+  }
+  
+  return kernel;
+}
+
+void uop(id<MTLCommandBuffer> cmd, id<MTLBuffer> X, id<MTLBuffer> output, std::string name, std::string op)
+{
+  id<MTLComputePipelineState> kernel = jit_kernel(jit_op::unary, name, op);
   
   assert(X.length == output.length);
   const uint32_t N = ((uint32_t)X.length) / sizeof(float);
@@ -1808,27 +1945,52 @@ void sigmoid(id<MTLCommandBuffer> cmd, id<MTLBuffer> X, id<MTLBuffer> output)
   [encoder endEncoding];
 }
 
-void sigmoidDerivative(id<MTLCommandBuffer> cmd, id<MTLBuffer> X, id<MTLBuffer> output)
+void bop(id<MTLCommandBuffer> cmd, id<MTLBuffer> X, id<MTLBuffer> Y, id<MTLBuffer> output, std::string name, std::string op)
 {
-  static id<MTLComputePipelineState> kernel;
-  static dispatch_once_t onceToken;
-  dispatch_once(&onceToken, ^{
-    auto kernelFunc = [gpu::lib newFunctionWithName:@"sigmoidDerivative"];
-    kernel = [gpu::device newComputePipelineStateWithFunction:kernelFunc error:nil];
-  });
-  if (!kernel) { NSLog(@"got error during pipeline creation"); return; }
-  
+  id<MTLComputePipelineState> kernel = jit_kernel(jit_op::binary, name, op);
+
   assert(X.length == output.length);
+  assert(Y.length == output.length);
   const uint32_t N = ((uint32_t)X.length) / sizeof(float);
   auto encoder = [cmd computeCommandEncoder];
   
   [encoder setBuffer:X offset:0 atIndex:0];
-  [encoder setBuffer:output offset:0 atIndex:1];
-  [encoder setBytes:(void*)&N length:sizeof(N) atIndex:2];
+  [encoder setBuffer:Y offset:0 atIndex:1];
+  [encoder setBuffer:output offset:0 atIndex:2];
+  [encoder setBytes:(void*)&N length:sizeof(N) atIndex:3];
   [encoder setComputePipelineState:kernel];
   [encoder dispatchThreads:MTLSizeMake(N / 2, 1, 1) threadsPerThreadgroup:MTLSizeMake(32 * 2, 1, 1)];
   
   [encoder endEncoding];
+}
+
+
+void sigmoid(id<MTLCommandBuffer> cmd, id<MTLBuffer> X, id<MTLBuffer> output)
+{
+  uop(cmd, X, output, "sigmoid", "output[i] = 1.0 / (1.0 + exp(-X[i]));");
+}
+
+void sigmoidDerivative(id<MTLCommandBuffer> cmd, id<MTLBuffer> X, id<MTLBuffer> output)
+{
+  uop(cmd, X, output, "sigmoidDerivative", R"(
+        float s = 1.0 / (1.0 + exp(-X[i]));
+        output[i] = s * (1.0 - s);
+  )");
+}
+
+void log2(id<MTLCommandBuffer> cmd, id<MTLBuffer> X, id<MTLBuffer> output)
+{
+  uop(cmd, X, output, "log2_op", R"(
+        output[i] = log2(X[i]);
+  )");
+}
+
+void crossEntropy(id<MTLCommandBuffer> cmd, id<MTLBuffer> P, id<MTLBuffer> Q, id<MTLBuffer> output)
+{
+  bop(cmd, P, Q, output, "crossEntropy", R"(
+  output[i] = X[i] * (Y[i] != 0 ? log(Y[i]) : 0) + (1 - X[i]) * ((1 - Y[i]) != 0 ? log(1 - Y[i]) : 0);
+  output[i] = -output[i];
+)");
 }
 
 void axpby(id<MTLCommandBuffer> cmd, id<MTLBuffer> X, id<MTLBuffer> Y, id<MTLBuffer> output, float fX, float fY, float A)
