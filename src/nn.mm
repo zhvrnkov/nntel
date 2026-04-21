@@ -318,6 +318,7 @@ virtual void applyGrad(tensor::device_type, float lr) {}
 virtual ~base() = default;
 };
 
+
 struct linear : public base {
   tensor::data_t weights;
   tensor::data_t biases;
@@ -431,8 +432,10 @@ struct sigmoid : public base {
 };
 }
 
+using model_t = std::vector<std::unique_ptr<layer::base>>;
+
 namespace helpers {
-const tensor::data_t forward(std::vector<nn::layer::linear>& model, const tensor::data_t& input, tensor::device_type);
+const tensor::data_t forward(model_t& model, const tensor::data_t& input, tensor::device_type);
 
 template<typename dims_t>
 std::vector<std::unique_ptr<nn::layer::base>> buildModel(dims_t dims);
@@ -526,7 +529,37 @@ private:
   std::mt19937 gen{};
 };
 
-void train(tensor::data_t trainingData, size_t epochs_count, size_t mini_batch_size, float learning_rate, std::optional<tensor::data_t> testData);
+std::pair<uint64_t, uint64_t> validate(nn::model_t& model, const tensor::data_t& input, const tensor::data_t& target, const tensor::device_type dev) {
+  auto mo = helpers::forward(model, input, dev);
+  nn::stream::global.synchronize();
+  std::vector<uint64_t> mo_results;
+  for (auto i = 0; i < mo.dims[1]; i++) {
+    auto col = mo.data() + i;
+    auto idx = 0;
+    for (auto j = 1; j < mo.dims[0]; j++) {
+      if (col[j * mo.dims[1]] > col[idx * mo.dims[1]]) {
+        idx = j;
+      }
+    }
+    mo_results.push_back(idx);
+  }
+  std::vector<uint64_t> target_results;
+  for (auto i = 0; i < mo.dims[1]; i++) {
+    auto col = target.data() + i;
+    auto idx = 0;
+    for (auto j = 1; j < mo.dims[0]; j++) {
+      if (col[j * mo.dims[1]] > col[idx * mo.dims[1]]) {
+        idx = j;
+      }
+    }
+    target_results.push_back(idx);
+  }
+  auto correct = 0;
+  for (auto i = 0; i < mo_results.size(); i++) {
+    if (mo_results[i] == target_results[i]) correct += 1;
+  }
+  return std::make_pair(correct, mo_results.size());
+}
 }
 }
 
@@ -1100,10 +1133,6 @@ void free(Buffer buff)
 {
   // delete[] buff.data;
 }
-}
-
-namespace nn {
-using model_t = std::vector<std::unique_ptr<nn::layer::base>>;
 }
 
 namespace nn::cost {

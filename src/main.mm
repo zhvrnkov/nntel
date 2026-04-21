@@ -163,5 +163,7 @@ int main()
     nn::stream::global.synchronize();
     std::cout << "cost = " << *cost.data() << std::endl;
   }
+  auto [correct, total] = nn::train::validate(model, testdata->first, testdata->second, device);
+  printf("%.3f\n accuracy [%llu | %llu]\n", ((float)correct) / ((float)total), correct, total);
   return 0;
 }
