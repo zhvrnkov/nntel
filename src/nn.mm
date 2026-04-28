@@ -42,8 +42,8 @@ void sigmoidDerivative(id<MTLCommandBuffer> cmd, id<MTLBuffer> X, id<MTLBuffer> 
 void crossEntropy(id<MTLCommandBuffer> cmd, id<MTLBuffer> X, id<MTLBuffer> Y, id<MTLBuffer> output);
 void axpby(id<MTLCommandBuffer> cmd, id<MTLBuffer> X, id<MTLBuffer> Y, id<MTLBuffer> output, float fX, float fY, float A);
 void axpby2dBcol(id<MTLCommandBuffer> cmd, id<MTLBuffer> X, id<MTLBuffer> Y, id<MTLBuffer> output, float fX, float fY, float A);
-void sum_dim0(id<MTLCommandBuffer> cmd, id<MTLBuffer> X, id<MTLBuffer> out, uint32_t Nrows, uint32_t Ncols, uint32_t stride);
-void sum_dim1(id<MTLCommandBuffer> cmd, id<MTLBuffer> X, id<MTLBuffer> out, uint32_t Nrows, uint32_t Ncols, uint32_t stride);
+void sum_dim0(id<MTLCommandBuffer> cmd, id<MTLBuffer> X, id<MTLBuffer> out, float scale, uint32_t Nrows, uint32_t Ncols, uint32_t stride);
+void sum_dim1(id<MTLCommandBuffer> cmd, id<MTLBuffer> X, id<MTLBuffer> out, float scale, uint32_t Nrows, uint32_t Ncols, uint32_t stride);
 void transpose(id<MTLCommandBuffer> cmd, id<MTLBuffer> X, id<MTLBuffer> out, uint32_t M, uint32_t N);
 void addcmul(id<MTLCommandBuffer> cmd, id<MTLBuffer> X, id<MTLBuffer> Y, id<MTLBuffer> output, float a, float b);
 void addcdiv(id<MTLCommandBuffer> cmd, id<MTLBuffer> X, id<MTLBuffer> Y, id<MTLBuffer> output, float a, float b);
@@ -92,9 +92,9 @@ void addcmul(const float* x, const float* y, float* output, int64_t N, float a, 
 void addcdiv(const float* x, const float* y, float* output, int64_t N, float a, float b);
 void sigmoid(const float* x, float* output, int64_t N);
 void sigmoidDerivative(const float* x, float* output, int64_t N);
-void sum(const float* x, float* output, int64_t N);
-void sum_dim0(const float* x, float* output, int64_t Nrows, int64_t Ncols, int64_t stride);
-void sum_dim1(const float* x, float* output, int64_t Nrows, int64_t Ncols, int64_t stride);
+void sum(const float* x, float* output, const float scale, int64_t N);
+void sum_dim0(const float* x, float* output, const float scale, int64_t Nrows, int64_t Ncols, int64_t stride);
+void sum_dim1(const float* x, float* output, const float scale, int64_t Nrows, int64_t Ncols, int64_t stride);
 }
 
 namespace accelerate {
@@ -108,9 +108,9 @@ void addcmul(const float* x, const float* y, float* output, int64_t N, float a, 
 void addcdiv(const float* x, const float* y, float* output, int64_t N, float a, float b);
 void sigmoid(const float* x, float* output, int64_t N);
 void sigmoidDerivative(const float* x, float* output, int64_t N);
-void sum(const float* x, float* output, int64_t N);
-void sum_dim0(const float* x, float* output, int64_t Nrows, int64_t Ncols, int64_t stride);
-void sum_dim1(const float* x, float* output, int64_t Nrows, int64_t Ncols, int64_t stride);
+void sum(const float* x, float* output, const float scale, int64_t N);
+void sum_dim0(const float* x, float* output, const float scale, int64_t Nrows, int64_t Ncols, int64_t stride);
+void sum_dim1(const float* x, float* output, const float scale, int64_t Nrows, int64_t Ncols, int64_t stride);
 void transpose(const float* m, float* mT, int64_t M, int64_t N);
 }
 
@@ -277,6 +277,7 @@ struct data_t {
   void flatten();
   
   void transpose(device_type dev = device_type::cpu);
+  data_t mean(device_type dev = device_type::cpu);
   
   data_t copy(tensor::device_type dev) const;
   
@@ -301,13 +302,14 @@ struct data_t {
 void matmul(const data_t& A, const data_t& B, data_t& C, device_type dev=device_type::cpu);
 void add(const data_t& A, const data_t& B, data_t& C, float a=1.0, float b=1.0, device_type dev=device_type::cpu);
 void sub(const data_t& A, const data_t& B, data_t& C, device_type dev=device_type::cpu);
-void mul(const data_t& A, const data_t& B, data_t& C, device_type dev=device_type::cpu);
+void mul(const data_t& A, const data_t& B, data_t& C, device_type dev=device_type::cpu, float factor = 1.0);
 void div(const data_t& A, const data_t& B, data_t& C, device_type dev=device_type::cpu);
 void sigmoid(const data_t& A, data_t& C, device_type=device_type::cpu);
 void sigmoidDerivative(const data_t& A, data_t& C, device_type=device_type::cpu);
 
-void sum(const data_t& A, data_t& C, int64_t dim=-1, device_type dev=device_type::cpu);
+void sum(const data_t& A, data_t& C, int64_t dim=-1, device_type dev=device_type::cpu, float scale=1.0);
 void transpose(const data_t& A, data_t& C, device_type dev=device_type::cpu);
+void mean(const data_t& X, data_t& out, device_type dev = device_type::cpu);
 }
 
 namespace layer {
@@ -862,7 +864,7 @@ void sub(const data_t& A, const data_t& B, data_t& C, device_type dev)
   nn::tensor::add(A, B, C, 1.0, -1.0, dev);
 }
 
-void mul(const data_t& A, const data_t& B, data_t& C, device_type dev)
+void mul(const data_t& A, const data_t& B, data_t& C, device_type dev, float factor)
 {
   if (B.dims.size() == 1 && B.size() == 1) {
     assert(A.size() == C.size());
@@ -870,11 +872,11 @@ void mul(const data_t& A, const data_t& B, data_t& C, device_type dev)
     if (dev == device_type::cpu || dev == device_type::accelerate) {
       auto axpbyFn = dev == device_type::accelerate ? nn::accelerate::axpby : nn::cpu::axpby;
       nn::stream::global.cpu_dispatch([=] {
-        axpbyFn(A.data(), A.data(), C.data(), A.size(), B.data()[0], 0.0, 0.0);
+        axpbyFn(A.data(), A.data(), C.data(), A.size(), B.data()[0] * factor, 0.0, 0.0);
       });
     } else if (dev == device_type::gpu) {
       nn::stream::global.gpu_dispatch([=] {
-        nn::gpu::axpby(stream::global.cmd, A.buff(), A.buff(), C.buff(), B.data()[0], 0.0, 0.0);
+        nn::gpu::axpby(stream::global.cmd, A.buff(), A.buff(), C.buff(), B.data()[0] * factor, 0.0, 0.0);
       });
     }
   } else if (A.dims.size() == B.dims.size()) {
@@ -890,7 +892,7 @@ void mul(const data_t& A, const data_t& B, data_t& C, device_type dev)
       });
     } else if (dev == device_type::gpu) {
       nn::stream::global.gpu_dispatch([=] {
-        nn::gpu::addcmul(stream::global.cmd, A.buff(), B.buff(), C.buff(), 1.0, 0.0);
+        nn::gpu::addcmul(stream::global.cmd, A.buff(), B.buff(), C.buff(), factor, 0.0);
       });
     }
   } else {
@@ -973,7 +975,7 @@ void crossEntropy(const data_t& A, const data_t& B, data_t& C, device_type dev)
   }
 }
 
-void sum(const data_t& A, data_t& C, int64_t dim, device_type dev)
+void sum(const data_t& A, data_t& C, int64_t dim, device_type dev, float scale)
 {
   if (dim == -1) {
     assert(C.dims.size() == 1);
@@ -981,11 +983,11 @@ void sum(const data_t& A, data_t& C, int64_t dim, device_type dev)
     if (dev == device_type::cpu || dev == device_type::accelerate) {
       auto sumFn = dev == device_type::accelerate ? nn::accelerate::sum : nn::cpu::sum;
       nn::stream::global.cpu_dispatch([=] {
-        sumFn(A.data(), C.data(), A.size());
+        sumFn(A.data(), C.data(), A.size(), scale);
       });
     } else if (dev == device_type::gpu) {
       nn::stream::global.gpu_dispatch([=] {
-        nn::gpu::sum(stream::global.cmd, A.buff(), 1.0, C.buff());
+        nn::gpu::sum(stream::global.cmd, A.buff(), scale, C.buff());
       });
     }
   } else {
@@ -996,11 +998,11 @@ void sum(const data_t& A, data_t& C, int64_t dim, device_type dev)
       if (dev == device_type::cpu || dev == device_type::accelerate) {
         auto sumDim0Fn = dev == device_type::accelerate ? nn::accelerate::sum_dim0 : nn::cpu::sum_dim0;
         nn::stream::global.cpu_dispatch([=] {
-          sumDim0Fn(A.data(), C.data(), A.dims[0], A.dims[1], A.dims[1]);
+          sumDim0Fn(A.data(), C.data(), A.dims[0], A.dims[1], A.dims[1], scale);
         });
       } else if (dev == device_type::gpu) {
         nn::stream::global.gpu_dispatch([=] {
-          nn::gpu::sum_dim0(stream::global.cmd, A.buff(), C.buff(),
+          nn::gpu::sum_dim0(stream::global.cmd, A.buff(), C.buff(), scale,
                             (uint32_t)A.dims[0], (uint32_t)A.dims[1],
                             (uint32_t)A.dims[1]);
         });
@@ -1010,11 +1012,11 @@ void sum(const data_t& A, data_t& C, int64_t dim, device_type dev)
       if (dev == device_type::cpu || dev == device_type::accelerate) {
         auto sumDim1Fn = dev == device_type::accelerate ? nn::accelerate::sum_dim1 : nn::cpu::sum_dim1;
         nn::stream::global.cpu_dispatch([=] {
-          sumDim1Fn(A.data(), C.data(), A.dims[0], A.dims[1], A.dims[1]);
+          sumDim1Fn(A.data(), C.data(), A.dims[0], A.dims[1], A.dims[1], scale);
         });
       } else if (dev == device_type::gpu) {
         nn::stream::global.gpu_dispatch([=] {
-          nn::gpu::sum_dim1(stream::global.cmd, A.buff(), C.buff(),
+          nn::gpu::sum_dim1(stream::global.cmd, A.buff(), C.buff(), scale,
                             (uint32_t)A.dims[0], (uint32_t)A.dims[1],
                             (uint32_t)A.dims[1]);
         });
@@ -1049,6 +1051,11 @@ void transpose(const data_t& A, data_t& C, device_type dev)
 
 }
 
+
+void mean(const data_t& X, data_t& out, device_type dev)
+{
+  tensor::sum(X, out, -1, dev, 1.0 / X.size());
+}
 }
 
 namespace nn::tensor {
@@ -1060,6 +1067,12 @@ void data_t::transpose(device_type dev) {
   tensor::transpose(*this, tself, dev);
   xs = tself.xs;
   dims = tself.dims;
+}
+
+data_t data_t::mean(device_type dev) {
+  data_t scalar = data_t::value({0.0});
+  tensor::mean(*this, scalar, dev);
+  return scalar;
 }
 
 void data_t::flatten() {
@@ -1135,7 +1148,7 @@ void free(Buffer buff)
 }
 }
 
-namespace nn::cost {
+namespace nn::loss {
 struct base {
   base(model_t& model, tensor::device_type device) : model(model), dev(device) {}
   virtual ~base() = default;
@@ -1156,20 +1169,18 @@ struct quadratic : public base {
     const auto modelOutput = nn::helpers::forward(model, inputs, dev);
     
     auto diff = nn::tensor::data_t::zero(modelOutput.dims);
-    auto cost = nn::tensor::data_t::value({0.0});
     auto diffSquared = diff;
+    auto loss = nn::tensor::data_t::zero({modelOutput.dims[1]});
     
     nn::tensor::sub(modelOutput, target, diff, dev);
     if (backwardInput.has_value()) {
       *backwardInput = diff;
       diffSquared = nn::tensor::data_t{diffSquared.dims};
     }
-    nn::tensor::mul(diff, diff, diffSquared, dev);
+    nn::tensor::mul(diff, diff, diffSquared, dev, 0.5);
+    nn::tensor::sum(diffSquared, loss, 0, dev);
     
-    nn::tensor::sum(diffSquared, cost, -1, dev);
-    nn::tensor::div(cost, nn::tensor::data_t::value({(float)2 * target.dims[1]}), cost, dev);
-    
-    return cost;
+    return loss;
   }
   
   void step(const tensor::data_t& input, const tensor::data_t& target, float lr) override {
@@ -1192,16 +1203,13 @@ struct cross_entropy : public base {
   tensor::data_t eval(const tensor::data_t &inputs, const tensor::data_t &outputs) override {
     const auto mo = nn::helpers::forward(model, inputs, dev);
     auto cross = nn::tensor::data_t(mo.dims);
-    auto cost = nn::tensor::data_t::value({0.0});
     if (backwardInput) {
       *backwardInput = nn::tensor::data_t::zero(mo.dims);
       nn::tensor::sub(mo, outputs, *backwardInput, dev);
     }
 
     nn::tensor::crossEntropy(outputs, mo, cross, dev);
-    nn::tensor::sum(cross, cost, -1, dev);
-    nn::tensor::div(cost, nn::tensor::data_t::value({(float)outputs.dims[1]}), cost, dev);
-    return cost;
+    return cross;
   }
   
   void step(const tensor::data_t &input, const tensor::data_t &target, float lr) override {
@@ -1545,7 +1553,7 @@ void axpby2dBcol(const float* x, const float* y, float* output, int64_t N, int64
   }
 }
 
-void sum(const float* x, float* output, int64_t N)
+void sum(const float* x, float* output, const float scale, int64_t N)
 {
   float acc = 0;
   int64_t i = 0;
@@ -1561,24 +1569,26 @@ void sum(const float* x, float* output, int64_t N)
   for (; i < N; i++) {
     acc += x[i];
   }
-  *output = acc;
+  *output = acc * scale;
 }
 
-void sum_dim0(const float* x, float* output, int64_t Nrows, int64_t Ncols, int64_t stride)
+void sum_dim0(const float* x, float* output, const float scale, int64_t Nrows, int64_t Ncols, int64_t stride)
 {
   for (int64_t row = 0; row < Nrows; row++) {
     for (int64_t col = 0; col < Ncols; col++) {
       output[col] += x[row * stride + col];
     }
   }
+  for (int64_t i = 0; i < Ncols; i++) output[i] *= scale;
 }
 
-void sum_dim1(const float* x, float* output, int64_t Nrows, int64_t Ncols, int64_t stride)
+void sum_dim1(const float* x, float* output, const float scale, int64_t Nrows, int64_t Ncols, int64_t stride)
 {
   for (int64_t row = 0; row < Nrows; row++) {
     for (int64_t col = 0; col < Ncols; col++) {
       output[row] += x[row * stride + col];
     }
+    output[row] *= scale;
   }
 }
 }
@@ -1673,23 +1683,28 @@ void sigmoidDerivative(const float* x, float* output, int64_t N)
   nn::cpu::sigmoidDerivative(x, output, N);
 }
 
-void sum(const float* x, float* output, int64_t N)
+void sum(const float* x, float* output, const float scale, int64_t N)
 {
   vDSP_sve(x, 1, output, (vDSP_Length)N);
+  *output *= scale;
 }
 
-void sum_dim0(const float* x, float* output, int64_t Nrows, int64_t Ncols, int64_t stride)
+void sum_dim0(const float* x, float* output, const float scale, int64_t Nrows, int64_t Ncols, int64_t stride)
 {
   memcpy(output, x, Ncols * sizeof(float));
   for (int64_t row = 1; row < Nrows; row++) {
     vDSP_vadd(x + row * stride, 1, output, 1, output, 1, (vDSP_Length)Ncols);
   }
+  if (scale != 1.0) {
+    vDSP_vsmul(output, 1, &scale, output, 1, Ncols);
+  }
 }
 
-void sum_dim1(const float* x, float* output, int64_t Nrows, int64_t Ncols, int64_t stride)
+void sum_dim1(const float* x, float* output, const float scale, int64_t Nrows, int64_t Ncols, int64_t stride)
 {
   for (int64_t row = 0; row < Nrows; row++) {
     vDSP_sve(x + row * stride, 1, &output[row], (vDSP_Length)Ncols);
+    output[row] *= scale;
   }
 }
 
@@ -2167,7 +2182,7 @@ void axpby2dBcol(id<MTLCommandBuffer> cmd, id<MTLBuffer> X, id<MTLBuffer> Y, id<
   [encoder endEncoding];
 }
 
-void sum_dim0(id<MTLCommandBuffer> cmd, id<MTLBuffer> X, id<MTLBuffer> out,
+void sum_dim0(id<MTLCommandBuffer> cmd, id<MTLBuffer> X, id<MTLBuffer> out, float scale,
               uint32_t Nrows, uint32_t Ncols, uint32_t stride)
 {
   static id<MTLComputePipelineState> kernel;
@@ -2184,12 +2199,13 @@ void sum_dim0(id<MTLCommandBuffer> cmd, id<MTLBuffer> X, id<MTLBuffer> out,
   [enc setBytes:&Nrows length:sizeof(Nrows) atIndex:2];
   [enc setBytes:&Ncols length:sizeof(Ncols) atIndex:3];
   [enc setBytes:&stride length:sizeof(stride) atIndex:4];
+  [enc setBytes:&scale length:sizeof(scale) atIndex:5];
   NSUInteger tg = kernel.maxTotalThreadsPerThreadgroup;
   [enc dispatchThreads:MTLSizeMake(Ncols, 1, 1) threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
   [enc endEncoding];
 }
 
-void sum_dim1(id<MTLCommandBuffer> cmd, id<MTLBuffer> X, id<MTLBuffer> out,
+void sum_dim1(id<MTLCommandBuffer> cmd, id<MTLBuffer> X, id<MTLBuffer> out, float scale,
               uint32_t Nrows, uint32_t Ncols, uint32_t stride)
 {
   static id<MTLComputePipelineState> kernel;
@@ -2206,6 +2222,7 @@ void sum_dim1(id<MTLCommandBuffer> cmd, id<MTLBuffer> X, id<MTLBuffer> out,
   [enc setBytes:&Nrows length:sizeof(Nrows) atIndex:2];
   [enc setBytes:&Ncols length:sizeof(Ncols) atIndex:3];
   [enc setBytes:&stride length:sizeof(stride) atIndex:4];
+  [enc setBytes:&scale length:sizeof(scale) atIndex:5];
   NSUInteger tg = kernel.maxTotalThreadsPerThreadgroup;
   [enc dispatchThreads:MTLSizeMake(Nrows, 1, 1) threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
   [enc endEncoding];

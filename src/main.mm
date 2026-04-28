@@ -147,8 +147,8 @@ int main()
 
   auto testdata = test_loader.nextBatch(device);
   test_loader.reset();
-  auto cost_f = nn::cost::cross_entropy(model, device);
-  auto cost = cost_f.eval(testdata->first, testdata->second);
+  auto cost_f = nn::loss::cross_entropy(model, device);
+  auto cost = cost_f.eval(testdata->first, testdata->second).mean(device);
   nn::stream::global.synchronize();
   std::cout << "initial cost = " << *cost.data() << std::endl;
 
@@ -159,7 +159,7 @@ int main()
     while ((batch = train_loader.nextBatch(device))) @autoreleasepool {
       cost_f.step(batch->first, batch->second, 0.5);
     }
-    auto cost = cost_f.eval(testdata->first, testdata->second);
+    auto cost = cost_f.eval(testdata->first, testdata->second).mean(device);
     nn::stream::global.synchronize();
     std::cout << "cost = " << *cost.data() << std::endl;
   }

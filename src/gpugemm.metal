@@ -845,13 +845,14 @@ kernel void sum_dim0(
                   constant const uint& Nrows,
                   constant const uint& Ncols,
                   constant const uint& stride,
+                  constant const float& scale,
                   uint gid [[thread_position_in_grid]]
                   )
 {
     if (gid >= Ncols) return;
     float acc = 0;
     for (uint i = 0; i < Nrows; i++) acc += X[i * stride + gid];
-    out[gid] = acc;
+    out[gid] = acc * scale;
 }
 
 kernel void sum_dim1(
@@ -860,13 +861,14 @@ kernel void sum_dim1(
                   constant const uint& Nrows,
                   constant const uint& Ncols,
                   constant const uint& stride,
+                  constant const float& scale,
                   uint gid [[thread_position_in_grid]]
                   )
 {
     if (gid >= Nrows) return;
     float acc = 0;
     for (uint j = 0; j < Ncols; j++) acc += X[gid * stride + j];
-    out[gid] = acc;
+    out[gid] = acc * scale;
 }
 
 kernel void transpose(
